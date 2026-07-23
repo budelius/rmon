@@ -3,7 +3,7 @@ mod pdh;
 
 use std::collections::HashMap;
 
-use crate::model::GpuSource;
+use crate::model::{GpuSource, GpuTelemetry};
 use nvml::NvmlGpuMonitor;
 use pdh::PdhGpuMonitor;
 
@@ -59,6 +59,12 @@ impl GpuMonitor {
         }
 
         HashMap::new()
+    }
+
+    /// Per-GPU temperature/throttle telemetry (empty when NVML is unavailable —
+    /// PDH counters don't expose temperature or throttle reasons).
+    pub fn telemetry(&self) -> Vec<GpuTelemetry> {
+        self.nvml.as_ref().map(|n| n.telemetry()).unwrap_or_default()
     }
 }
 

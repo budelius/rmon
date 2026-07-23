@@ -7,8 +7,11 @@ mod history;
 mod model;
 mod sampler;
 mod storage;
+mod thermal;
+mod tree;
 
 pub use history::RollingHistory;
-pub use model::{GpuSource, ProcessSample, Snapshot};
+pub use model::{GpuSource, GpuTelemetry, ProcessSample, Snapshot, SystemMetrics};
 pub use sampler::Sampler;
 pub use storage::Store;
+pub use tree::build_tree;

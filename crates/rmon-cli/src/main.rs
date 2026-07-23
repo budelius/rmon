@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rmon_core::{GpuSource, Sampler, Snapshot, Store};
+use rmon_core::{build_tree, GpuSource, ProcessSample, Sampler, Snapshot, Store, SystemMetrics};
 
 #[derive(Parser)]
 #[command(name = "rmon", about = "rMon: see what process is using your CPU and GPU")]
@@ -21,6 +21,9 @@ enum Command {
         /// Only show the top N processes by combined CPU+GPU usage.
         #[arg(long, default_value_t = 20)]
         top: usize,
+        /// Print as a parent/child process tree instead of a flat ranked list.
+        #[arg(long)]
+        tree: bool,
     },
     /// Sample on an interval and persist to SQLite (and optionally CSV) until stopped with Ctrl+C.
     Record {
@@ -44,7 +47,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Snapshot { top } => run_snapshot(top),
+        Command::Snapshot { top, tree } => run_snapshot(top, tree),
         Command::Record {
             db,
             csv,
@@ -54,7 +57,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_snapshot(top: usize) -> Result<()> {
+fn run_snapshot(top: usize, tree: bool) -> Result<()> {
     let mut sampler = Sampler::new();
     if !sampler.has_gpu_source() {
         eprintln!("warning: no GPU data source available (no NVIDIA driver and no 'GPU Engine' perf counters); GPU column will read 0.0");
@@ -66,8 +69,25 @@ fn run_snapshot(top: usize) -> Result<()> {
     std::thread::sleep(Duration::from_millis(600));
     let snapshot = sampler.sample();
 
-    print_table(&snapshot, top);
+    if tree {
+        print_tree(&snapshot, top);
+    } else {
+        print_table(&snapshot, top);
+    }
+    println!("{}", thermal_summary(&snapshot.system));
     Ok(())
+}
+
+fn gpu_src_label(src: GpuSource) -> &'static str {
+    match src {
+        GpuSource::Nvml => "nvml",
+        GpuSource::Pdh => "pdh",
+        GpuSource::Unavailable => "-",
+    }
+}
+
+fn truncate(name: &str, max: usize) -> &str {
+    if name.len() > max { &name[..max] } else { name }
 }
 
 fn print_table(snapshot: &Snapshot, top: usize) {
@@ -76,19 +96,13 @@ fn print_table(snapshot: &Snapshot, top: usize) {
         "PID", "NAME", "CPU%", "GPU%", "SRC"
     );
     for p in snapshot.sorted_by_usage().into_iter().take(top) {
-        let src = match p.gpu_source {
-            GpuSource::Nvml => "nvml",
-            GpuSource::Pdh => "pdh",
-            GpuSource::Unavailable => "-",
-        };
-        let name = if p.name.len() > 32 {
-            &p.name[..32]
-        } else {
-            &p.name
-        };
         println!(
             "{:<8} {:<32} {:>8.1} {:>8.1} {:<6}",
-            p.pid, name, p.cpu_percent, p.gpu_percent, src
+            p.pid,
+            truncate(&p.name, 32),
+            p.cpu_percent,
+            p.gpu_percent,
+            gpu_src_label(p.gpu_source)
         );
     }
     println!(
@@ -97,6 +111,51 @@ fn print_table(snapshot: &Snapshot, top: usize) {
         snapshot.total_cpu_percent(),
         snapshot.total_gpu_percent()
     );
+}
+
+fn print_tree(snapshot: &Snapshot, top: usize) {
+    println!(
+        "{:<8} {:<40} {:>8} {:>8} {:<6}",
+        "PID", "NAME", "CPU%", "GPU%", "SRC"
+    );
+    let rows = build_tree(&snapshot.processes, |p: &ProcessSample| {
+        p.cpu_percent + p.gpu_percent
+    });
+    for (depth, p) in rows.into_iter().take(top) {
+        let indent = "  ".repeat(depth);
+        let prefix = if depth > 0 { "└ " } else { "" };
+        let name = format!("{indent}{prefix}{}", p.name);
+        println!(
+            "{:<8} {:<40} {:>8.1} {:>8.1} {:<6}",
+            p.pid,
+            truncate(&name, 40),
+            p.cpu_percent,
+            p.gpu_percent,
+            gpu_src_label(p.gpu_source)
+        );
+    }
+}
+
+fn thermal_summary(system: &SystemMetrics) -> String {
+    let cpu_temp = system
+        .cpu_temp_c
+        .map(|t| format!("{t:.0}°C"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let cpu_clock = system
+        .cpu_clock_ratio
+        .map(|r| format!("{:.0}% clock", r * 100.0))
+        .unwrap_or_else(|| "clock n/a".to_string());
+    let throttle = if system.cpu_throttled { " [possibly throttled]" } else { "" };
+    let mut out = format!("CPU: {cpu_temp} {cpu_clock}{throttle}");
+    for gpu in &system.gpus {
+        let temp = gpu
+            .temp_c
+            .map(|t| format!("{t:.0}°C"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let throttle = if gpu.thermal_throttled { " [THERMAL THROTTLE]" } else { "" };
+        out.push_str(&format!("   {}: {temp}{throttle}", gpu.name));
+    }
+    out
 }
 
 fn run_record(
@@ -185,10 +244,11 @@ fn run_record(
         ticks += 1;
         if ticks.is_multiple_of(10) {
             println!(
-                "{ticks} samples taken, {} processes, total CPU {:.1}%, total GPU {:.1}%",
+                "{ticks} samples taken, {} processes, total CPU {:.1}%, total GPU {:.1}%   {}",
                 snapshot.processes.len(),
                 snapshot.total_cpu_percent(),
-                snapshot.total_gpu_percent()
+                snapshot.total_gpu_percent(),
+                thermal_summary(&snapshot.system)
             );
         }
 

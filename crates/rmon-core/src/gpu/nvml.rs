@@ -6,6 +6,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use nvml_wrapper::Nvml;
+use nvml_wrapper::bitmasks::device::ThrottleReasons;
+use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+
+use crate::model::GpuTelemetry;
 
 pub struct NvmlGpuMonitor {
     nvml: Nvml,
@@ -58,4 +62,57 @@ impl NvmlGpuMonitor {
 
         Ok(totals)
     }
+
+    /// Per-GPU temperature and throttle-reason telemetry.
+    pub fn telemetry(&self) -> Vec<GpuTelemetry> {
+        (0..self.device_count)
+            .filter_map(|idx| {
+                let device = self.nvml.device_by_index(idx).ok()?;
+                let name = device
+                    .name()
+                    .unwrap_or_else(|_| format!("GPU {idx}"));
+                let temp_c = device
+                    .temperature(TemperatureSensor::Gpu)
+                    .ok()
+                    .map(|t| t as f32);
+                let reasons = device
+                    .current_throttle_reasons()
+                    .unwrap_or(ThrottleReasons::NONE);
+                let thermal_throttled = reasons.intersects(
+                    ThrottleReasons::SW_THERMAL_SLOWDOWN | ThrottleReasons::HW_THERMAL_SLOWDOWN,
+                );
+                Some(GpuTelemetry {
+                    index: idx,
+                    name,
+                    temp_c,
+                    thermal_throttled,
+                    throttle_reasons: throttle_reason_labels(reasons),
+                })
+            })
+            .collect()
+    }
+}
+
+fn throttle_reason_labels(reasons: ThrottleReasons) -> Vec<String> {
+    const FLAGS: &[(ThrottleReasons, &str)] = &[
+        (ThrottleReasons::SW_THERMAL_SLOWDOWN, "sw-thermal"),
+        (ThrottleReasons::HW_THERMAL_SLOWDOWN, "hw-thermal"),
+        (ThrottleReasons::HW_SLOWDOWN, "hw-slowdown"),
+        (
+            ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN,
+            "hw-power-brake",
+        ),
+        (ThrottleReasons::SW_POWER_CAP, "power-cap"),
+        (ThrottleReasons::SYNC_BOOST, "sync-boost"),
+        (
+            ThrottleReasons::APPLICATIONS_CLOCKS_SETTING,
+            "app-clock-setting",
+        ),
+        (ThrottleReasons::DISPLAY_CLOCK_SETTING, "display-clock"),
+    ];
+    FLAGS
+        .iter()
+        .filter(|(flag, _)| reasons.contains(*flag))
+        .map(|(_, label)| label.to_string())
+        .collect()
 }

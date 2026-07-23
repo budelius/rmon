@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use std::str::FromStr;
 
-use crate::model::{GpuSource, ProcessSample, Snapshot};
+use crate::model::{GpuSource, ProcessSample, Snapshot, SystemMetrics};
 
 pub struct Store {
     conn: Connection,
@@ -33,6 +33,7 @@ impl Store {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER NOT NULL,
                 pid INTEGER NOT NULL,
+                ppid INTEGER,
                 name TEXT NOT NULL,
                 cpu_percent REAL NOT NULL,
                 gpu_percent REAL NOT NULL,
@@ -52,14 +53,15 @@ impl Store {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO samples (ts, pid, name, cpu_percent, gpu_percent, gpu_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO samples (ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             let ts = snapshot.timestamp.timestamp_millis();
             for p in &snapshot.processes {
                 stmt.execute(rusqlite::params![
                     ts,
                     p.pid,
+                    p.ppid,
                     p.name,
                     p.cpu_percent,
                     p.gpu_percent,
@@ -78,21 +80,22 @@ impl Store {
         until: DateTime<Utc>,
     ) -> Result<Vec<Snapshot>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts, pid, name, cpu_percent, gpu_percent, gpu_source
+            "SELECT ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source
              FROM samples WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts ASC",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![since.timestamp_millis(), until.timestamp_millis()],
             |row| {
                 let ts_millis: i64 = row.get(0)?;
-                let gpu_source: String = row.get(5)?;
+                let gpu_source: String = row.get(6)?;
                 Ok((
                     ts_millis,
                     ProcessSample {
                         pid: row.get(1)?,
-                        name: row.get(2)?,
-                        cpu_percent: row.get(3)?,
-                        gpu_percent: row.get(4)?,
+                        ppid: row.get(2)?,
+                        name: row.get(3)?,
+                        cpu_percent: row.get(4)?,
+                        gpu_percent: row.get(5)?,
                         gpu_source: GpuSource::from_str(&gpu_source).unwrap(),
                     },
                 ))
@@ -112,6 +115,7 @@ impl Store {
                     snapshots.push(Snapshot {
                         timestamp,
                         processes: vec![sample],
+                        system: SystemMetrics::default(),
                     });
                 }
             }

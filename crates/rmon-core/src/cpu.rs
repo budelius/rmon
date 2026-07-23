@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+/// One process's CPU-side info from a single sampling tick.
+pub struct ProcCpuInfo {
+    pub name: String,
+    pub cpu_percent: f32,
+    pub ppid: Option<u32>,
+}
+
 /// Wraps `sysinfo` to report per-process CPU usage.
 ///
 /// `sysinfo` computes CPU percent as a delta since the previous refresh, so
@@ -26,8 +33,8 @@ impl CpuMonitor {
         Self { sys }
     }
 
-    /// Returns pid -> (process name, cpu percent 0..=100*num_cores).
-    pub fn sample(&mut self) -> HashMap<u32, (String, f32)> {
+    /// Returns pid -> per-process CPU info.
+    pub fn sample(&mut self) -> HashMap<u32, ProcCpuInfo> {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -36,15 +43,27 @@ impl CpuMonitor {
                 .with_memory()
                 .with_exe(UpdateKind::OnlyIfNotSet),
         );
+        self.sys.refresh_cpu_usage();
 
         self.sys
             .processes()
             .iter()
             .map(|(pid, proc_)| {
                 let name = proc_.name().to_string_lossy().to_string();
-                (pid.as_u32(), (name, proc_.cpu_usage()))
+                let info = ProcCpuInfo {
+                    name,
+                    cpu_percent: proc_.cpu_usage(),
+                    ppid: proc_.parent().map(|p| p.as_u32()),
+                };
+                (pid.as_u32(), info)
             })
             .collect()
+    }
+
+    /// Average CPU utilization across all logical cores, 0..=100, as of the
+    /// last `sample()` call.
+    pub fn global_usage(&self) -> f32 {
+        self.sys.global_cpu_usage()
     }
 }
 

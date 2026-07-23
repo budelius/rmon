@@ -38,13 +38,47 @@ impl FromStr for GpuSource {
 }
 
 /// One process's resource usage at a single point in time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessSample {
     pub pid: u32,
+    pub ppid: Option<u32>,
     pub name: String,
     pub cpu_percent: f32,
     pub gpu_percent: f32,
     pub gpu_source: GpuSource,
+}
+
+/// Per-GPU temperature and throttle telemetry (NVIDIA only, via NVML).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuTelemetry {
+    pub index: u32,
+    pub name: String,
+    pub temp_c: Option<f32>,
+    /// True when NVML reports an unambiguous thermal throttle reason
+    /// (SW or HW thermal slowdown), i.e. clocks are being reduced because
+    /// of temperature specifically.
+    pub thermal_throttled: bool,
+    /// Human-readable active throttle reasons (may include non-thermal ones
+    /// such as power capping), for display.
+    pub throttle_reasons: Vec<String>,
+}
+
+/// System-wide (not per-process) thermal telemetry for one sampling tick.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemMetrics {
+    /// Average ACPI thermal zone temperature, in °C. Best-effort: many
+    /// systems don't expose an accurate (or any) reading here without
+    /// vendor tools, so this is frequently `None`.
+    pub cpu_temp_c: Option<f32>,
+    /// Current clock speed / max clock speed, averaged across logical
+    /// processors reported by `Win32_Processor` (0.0..=1.0).
+    pub cpu_clock_ratio: Option<f32>,
+    /// Heuristic: clocks are running well below the rated maximum while the
+    /// CPU is busy. This is NOT confirmed to be thermal specifically —
+    /// Windows exposes no vendor-neutral "throttled because of temperature"
+    /// flag for CPUs the way NVML does for GPUs.
+    pub cpu_throttled: bool,
+    pub gpus: Vec<GpuTelemetry>,
 }
 
 /// All process samples collected at a single point in time.
@@ -52,6 +86,7 @@ pub struct ProcessSample {
 pub struct Snapshot {
     pub timestamp: DateTime<Utc>,
     pub processes: Vec<ProcessSample>,
+    pub system: SystemMetrics,
 }
 
 impl Snapshot {
