@@ -1,0 +1,16 @@
+[package]
+name = "rmon-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rmon-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+rmon-core = { version = "0.1.0", path = "../rmon-core" }

@@ -1,0 +1,16 @@
+[package]
+name = "rmon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+log = "0.4.33"
+nvml-wrapper = "0.12.1"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = "0.38.4"
+thiserror = "2.0.19"
+windows = { version = "0.62.2", features = ["Win32_System_Performance", "Win32_Foundation", "Win32_System_Threading"] }
