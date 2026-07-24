@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rmon_core::{build_tree, GpuSource, ProcessSample, Sampler, Snapshot, Store, SystemMetrics};
+use rmon_core::{build_tree, list_open_files, GpuSource, ProcessSample, Sampler, Snapshot, Store, SystemMetrics};
 
 #[derive(Parser)]
 #[command(name = "rmon", about = "rMon: see what process is using your CPU and GPU")]
@@ -24,6 +24,10 @@ enum Command {
         /// Print as a parent/child process tree instead of a flat ranked list.
         #[arg(long)]
         tree: bool,
+        /// With --tree, rank each subtree by the summed CPU+GPU usage of the
+        /// process and all its descendants, instead of its own usage.
+        #[arg(long, requires = "tree")]
+        subtree: bool,
     },
     /// Sample on an interval and persist to SQLite (and optionally CSV) until stopped with Ctrl+C.
     Record {
@@ -40,6 +44,13 @@ enum Command {
         #[arg(long)]
         duration_secs: Option<u64>,
     },
+    /// Best-effort list of files a process currently has open (may need Administrator for other users' processes).
+    Files {
+        pid: u32,
+        /// Only show paths containing this substring.
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -47,17 +58,40 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Snapshot { top, tree } => run_snapshot(top, tree),
+        Command::Snapshot { top, tree, subtree } => run_snapshot(top, tree, subtree),
         Command::Record {
             db,
             csv,
             interval_ms,
             duration_secs,
         } => run_record(db, csv, interval_ms, duration_secs),
+        Command::Files { pid, filter } => run_files(pid, filter),
     }
 }
 
-fn run_snapshot(top: usize, tree: bool) -> Result<()> {
+fn run_files(pid: u32, filter: Option<String>) -> Result<()> {
+    let scan = list_open_files(pid)?;
+    let filter = filter.map(|f| f.to_lowercase());
+    let mut shown = 0usize;
+    for path in &scan.paths {
+        if let Some(f) = &filter
+            && !path.to_lowercase().contains(f.as_str())
+        {
+            continue;
+        }
+        println!("{path}");
+        shown += 1;
+    }
+    println!(
+        "\n{shown} of {} open file(s) shown ({} handles scanned, {} timed out)",
+        scan.paths.len(),
+        scan.handles_seen,
+        scan.timed_out
+    );
+    Ok(())
+}
+
+fn run_snapshot(top: usize, tree: bool, subtree: bool) -> Result<()> {
     let mut sampler = Sampler::new();
     if !sampler.has_gpu_source() {
         eprintln!("warning: no GPU data source available (no NVIDIA driver and no 'GPU Engine' perf counters); GPU column will read 0.0");
@@ -70,7 +104,7 @@ fn run_snapshot(top: usize, tree: bool) -> Result<()> {
     let snapshot = sampler.sample();
 
     if tree {
-        print_tree(&snapshot, top);
+        print_tree(&snapshot, top, subtree);
     } else {
         print_table(&snapshot, top);
     }
@@ -113,14 +147,16 @@ fn print_table(snapshot: &Snapshot, top: usize) {
     );
 }
 
-fn print_tree(snapshot: &Snapshot, top: usize) {
+fn print_tree(snapshot: &Snapshot, top: usize, subtree: bool) {
     println!(
         "{:<8} {:<40} {:>8} {:>8} {:<6}",
         "PID", "NAME", "CPU%", "GPU%", "SRC"
     );
-    let rows = build_tree(&snapshot.processes, |p: &ProcessSample| {
-        p.cpu_percent + p.gpu_percent
-    });
+    let rows = build_tree(
+        &snapshot.processes,
+        |p: &ProcessSample| p.cpu_percent + p.gpu_percent,
+        subtree,
+    );
     for (depth, p) in rows.into_iter().take(top) {
         let indent = "  ".repeat(depth);
         let prefix = if depth > 0 { "└ " } else { "" };

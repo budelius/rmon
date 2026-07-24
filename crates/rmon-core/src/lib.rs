@@ -3,6 +3,7 @@
 
 mod cpu;
 mod gpu;
+mod handles;
 mod history;
 mod model;
 mod sampler;
@@ -10,6 +11,7 @@ mod storage;
 mod thermal;
 mod tree;
 
+pub use handles::{list_open_files, OpenFilesScan};
 pub use history::RollingHistory;
 pub use model::{GpuSource, GpuTelemetry, ProcessSample, Snapshot, SystemMetrics};
 pub use sampler::Sampler;

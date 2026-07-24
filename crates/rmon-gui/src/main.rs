@@ -1,28 +1,66 @@
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
-use rmon_core::{build_tree, GpuSource, ProcessSample, RollingHistory, Sampler, Store, SystemMetrics};
+use rmon_core::{
+    build_tree, list_open_files, GpuSource, OpenFilesScan, ProcessSample, RollingHistory, Sampler,
+    Store, SystemMetrics,
+};
 
 const RETAIN: Duration = Duration::from_secs(300);
 const TICK: Duration = Duration::from_millis(1000);
 const SPARK_POINTS: usize = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SortMode {
+enum SortMetric {
     Cpu,
     Gpu,
     Total,
 }
 
-impl SortMode {
-    fn key(self, p: &ProcessSample) -> f32 {
-        match self {
-            SortMode::Cpu => p.cpu_percent,
-            SortMode::Gpu => p.gpu_percent,
-            SortMode::Total => p.cpu_percent + p.gpu_percent,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortWindow {
+    Instant,
+    Accumulated,
+}
+
+fn score(history: &RollingHistory, metric: SortMetric, window: SortWindow, p: &ProcessSample) -> f32 {
+    match window {
+        SortWindow::Instant => match metric {
+            SortMetric::Cpu => p.cpu_percent,
+            SortMetric::Gpu => p.gpu_percent,
+            SortMetric::Total => p.cpu_percent + p.gpu_percent,
+        },
+        SortWindow::Accumulated => {
+            let (cpu_s, gpu_s) = history.accumulated(p.pid);
+            match metric {
+                SortMetric::Cpu => cpu_s as f32,
+                SortMetric::Gpu => gpu_s as f32,
+                SortMetric::Total => (cpu_s + gpu_s) as f32,
+            }
         }
     }
+}
+
+/// Formats a duration compactly, e.g. "3h12m", "45m", "38s".
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Formats accumulated percent-seconds as approximate core-time, e.g. "4m12s".
+fn format_core_time(pct_seconds: f64) -> String {
+    format_duration(Duration::from_secs_f64((pct_seconds / 100.0).max(0.0)))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,17 +69,72 @@ enum ViewMode {
     Tree,
 }
 
+enum FilesStatus {
+    Scanning(mpsc::Receiver<Result<OpenFilesScan, String>>),
+    Done(OpenFilesScan),
+    Error(String),
+}
+
+struct FilesState {
+    pid: u32,
+    name: String,
+    status: FilesStatus,
+    search: String,
+}
+
+impl FilesState {
+    fn start(pid: u32, name: String) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = list_open_files(pid).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        Self {
+            pid,
+            name,
+            status: FilesStatus::Scanning(rx),
+            search: String::new(),
+        }
+    }
+
+    fn poll(&mut self) {
+        if let FilesStatus::Scanning(rx) = &self.status
+            && let Ok(result) = rx.try_recv()
+        {
+            self.status = match result {
+                Ok(scan) => FilesStatus::Done(scan),
+                Err(e) => FilesStatus::Error(e),
+            };
+        }
+    }
+
+    fn filtered_paths(&self) -> Vec<&str> {
+        let FilesStatus::Done(scan) = &self.status else {
+            return Vec::new();
+        };
+        let f = self.search.to_lowercase();
+        scan.paths
+            .iter()
+            .filter(|p| f.is_empty() || p.to_lowercase().contains(&f))
+            .map(|s| s.as_str())
+            .collect()
+    }
+}
+
 struct RmonApp {
     sampler: Sampler,
     history: RollingHistory,
     has_gpu_source: bool,
-    sort_mode: SortMode,
+    sort_metric: SortMetric,
+    sort_window: SortWindow,
+    subtree_sort: bool,
     view_mode: ViewMode,
     filter: String,
     rows: Vec<(usize, ProcessSample)>,
     selected_pid: Option<u32>,
     last_tick: Instant,
     system: SystemMetrics,
+    files: Option<FilesState>,
 
     recording: bool,
     db_path: String,
@@ -58,13 +151,16 @@ impl RmonApp {
             sampler,
             history: RollingHistory::new(RETAIN),
             has_gpu_source,
-            sort_mode: SortMode::Total,
+            sort_metric: SortMetric::Total,
+            sort_window: SortWindow::Instant,
+            subtree_sort: false,
             view_mode: ViewMode::Flat,
             filter: String::new(),
             rows: Vec::new(),
             selected_pid: None,
             last_tick: Instant::now() - TICK,
             system: SystemMetrics::default(),
+            files: None,
             recording: false,
             db_path: "rmon.sqlite".to_string(),
             store: None,
@@ -110,18 +206,18 @@ impl RmonApp {
             .cloned()
             .collect();
 
+        let history = &self.history;
+        let metric = self.sort_metric;
+        let window = self.sort_window;
+        let key = |p: &ProcessSample| score(history, metric, window, p);
+
         self.rows = match self.view_mode {
             ViewMode::Flat => {
                 let mut v = filtered;
-                v.sort_by(|a, b| {
-                    self.sort_mode
-                        .key(b)
-                        .partial_cmp(&self.sort_mode.key(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                v.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
                 v.into_iter().map(|p| (0, p)).collect()
             }
-            ViewMode::Tree => build_tree(&filtered, |p| self.sort_mode.key(p)),
+            ViewMode::Tree => build_tree(&filtered, key, self.subtree_sort),
         };
 
         if let Some(pid) = self.selected_pid
@@ -141,6 +237,9 @@ impl eframe::App for RmonApp {
             self.tick();
             self.last_tick = Instant::now();
         }
+        if let Some(fs) = self.files.as_mut() {
+            fs.poll();
+        }
         ui.ctx().request_repaint_after(Duration::from_millis(200));
 
         egui::Panel::top("header").show(ui, |ui| {
@@ -157,11 +256,16 @@ impl eframe::App for RmonApp {
                 ui.label("view:");
                 changed |= ui.selectable_value(&mut self.view_mode, ViewMode::Flat, "flat").changed();
                 changed |= ui.selectable_value(&mut self.view_mode, ViewMode::Tree, "tree").changed();
+                if self.view_mode == ViewMode::Tree {
+                    changed |= ui.checkbox(&mut self.subtree_sort, "rank by subtree total").changed();
+                }
                 ui.separator();
                 ui.label("sort:");
-                changed |= ui.selectable_value(&mut self.sort_mode, SortMode::Total, "CPU+GPU").changed();
-                changed |= ui.selectable_value(&mut self.sort_mode, SortMode::Cpu, "CPU%").changed();
-                changed |= ui.selectable_value(&mut self.sort_mode, SortMode::Gpu, "GPU%").changed();
+                changed |= ui.selectable_value(&mut self.sort_metric, SortMetric::Total, "CPU+GPU").changed();
+                changed |= ui.selectable_value(&mut self.sort_metric, SortMetric::Cpu, "CPU%").changed();
+                changed |= ui.selectable_value(&mut self.sort_metric, SortMetric::Gpu, "GPU%").changed();
+                changed |= ui.selectable_value(&mut self.sort_window, SortWindow::Instant, "instant").changed();
+                changed |= ui.selectable_value(&mut self.sort_window, SortWindow::Accumulated, "accumulated (24h)").changed();
                 ui.separator();
                 ui.label("search:");
                 changed |= ui.text_edit_singleline(&mut self.filter).changed();
@@ -180,6 +284,11 @@ impl eframe::App for RmonApp {
             });
             ui.horizontal(|ui| {
                 thermal_line(ui, &self.system);
+                ui.separator();
+                ui.weak(format!(
+                    "accumulation window: {} of up to 24h",
+                    format_duration(self.history.accum_window())
+                ));
             });
             ui.add_space(4.0);
         });
@@ -189,7 +298,11 @@ impl eframe::App for RmonApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.draw_table(ui);
+            if self.files.is_some() {
+                self.draw_files(ui);
+            } else {
+                self.draw_table(ui);
+            }
         });
     }
 }
@@ -341,7 +454,7 @@ impl RmonApp {
         }
     }
 
-    fn draw_detail(&self, ui: &mut egui::Ui) {
+    fn draw_detail(&mut self, ui: &mut egui::Ui) {
         let Some(pid) = self.selected_pid else {
             ui.label("Select a process to see its history.");
             return;
@@ -350,9 +463,14 @@ impl RmonApp {
             .rows
             .iter()
             .find(|(_, p)| p.pid == pid)
-            .map(|(_, p)| p.name.as_str())
-            .unwrap_or("?");
-        ui.heading(format!("{name} ({pid})"));
+            .map(|(_, p)| p.name.clone())
+            .unwrap_or_else(|| "?".to_string());
+        ui.horizontal(|ui| {
+            ui.heading(format!("{name} ({pid})"));
+            if ui.button("📂 open files").clicked() {
+                self.files = Some(FilesState::start(pid, name.clone()));
+            }
+        });
 
         let series = self.history.series_for_pid(pid);
         if series.is_empty() {
@@ -380,6 +498,13 @@ impl RmonApp {
                 (last.0 - t0).num_milliseconds() as f64 / 1000.0
             ));
         }
+        let (cpu_accum, gpu_accum) = self.history.accumulated(pid);
+        ui.label(format!(
+            "accumulated: CPU {} · GPU {}  (over {})",
+            format_core_time(cpu_accum),
+            format_core_time(gpu_accum),
+            format_duration(self.history.accum_window()),
+        ));
 
         Plot::new(format!("history-{pid}"))
             .legend(Legend::default())
@@ -390,6 +515,71 @@ impl RmonApp {
                 plot_ui.line(Line::new("CPU%", PlotPoints::new(cpu_points)));
                 plot_ui.line(Line::new("GPU%", PlotPoints::new(gpu_points)));
             });
+    }
+
+    fn draw_files(&mut self, ui: &mut egui::Ui) {
+        let mut go_back = false;
+        let mut rescan = false;
+
+        if let Some(fs) = self.files.as_mut() {
+            ui.horizontal(|ui| {
+                if ui.button("← back to process list").clicked() {
+                    go_back = true;
+                }
+                ui.heading(format!("Open files: {} ({})", fs.name, fs.pid));
+                if !matches!(fs.status, FilesStatus::Scanning(_)) && ui.button("rescan").clicked() {
+                    rescan = true;
+                }
+            });
+
+            match &fs.status {
+                FilesStatus::Scanning(_) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            "scanning... (walks the process's kernel handle table; can take a few seconds)",
+                        );
+                    });
+                }
+                FilesStatus::Done(scan) => {
+                    ui.label(format!(
+                        "{} open file(s)   ({} handles scanned, {} timed out)",
+                        scan.paths.len(),
+                        scan.handles_seen,
+                        scan.timed_out
+                    ));
+                }
+                FilesStatus::Error(e) => {
+                    ui.colored_label(egui::Color32::RED, format!("error: {e}"));
+                }
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("search:");
+                ui.text_edit_singleline(&mut fs.search);
+            });
+            ui.separator();
+
+            let paths = fs.filtered_paths();
+            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, paths.len(), |ui, range| {
+                    for i in range {
+                        ui.label(paths[i]);
+                    }
+                });
+        }
+
+        if go_back {
+            self.files = None;
+        } else if rescan
+            && let Some(fs) = &self.files
+        {
+            let pid = fs.pid;
+            let name = fs.name.clone();
+            self.files = Some(FilesState::start(pid, name));
+        }
     }
 }
 
