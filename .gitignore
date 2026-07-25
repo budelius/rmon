@@ -3,4 +3,4 @@
 *.sqlite-wal
 *.sqlite-shm
 *.csv
-/hook_outputs
+hook_outputs/
