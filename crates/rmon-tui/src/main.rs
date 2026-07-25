@@ -325,9 +325,14 @@ fn format_core_time(pct_seconds: f64) -> String {
 }
 
 fn main() -> Result<()> {
+    // Held for the process lifetime so buffered Sentry/rustrak events flush on exit.
+    let _sentry = rmon_core::observability::init_sentry();
     let mut terminal = ratatui::init();
     let result = run(&mut terminal);
     ratatui::restore();
+    if let Err(err) = &result {
+        rmon_core::observability::capture_anyhow(err);
+    }
     result
 }
 

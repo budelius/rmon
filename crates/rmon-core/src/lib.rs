@@ -6,6 +6,7 @@ mod gpu;
 mod handles;
 mod history;
 mod model;
+pub mod observability;
 mod sampler;
 mod storage;
 mod thermal;

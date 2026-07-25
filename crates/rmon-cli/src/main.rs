@@ -55,9 +55,11 @@ enum Command {
 
 fn main() -> Result<()> {
     env_logger::init();
+    // Held for the process lifetime so buffered Sentry/rustrak events flush on exit.
+    let _sentry = rmon_core::observability::init_sentry();
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Command::Snapshot { top, tree, subtree } => run_snapshot(top, tree, subtree),
         Command::Record {
             db,
@@ -66,7 +68,11 @@ fn main() -> Result<()> {
             duration_secs,
         } => run_record(db, csv, interval_ms, duration_secs),
         Command::Files { pid, filter } => run_files(pid, filter),
+    };
+    if let Err(err) = &result {
+        rmon_core::observability::capture_anyhow(err);
     }
+    result
 }
 
 fn run_files(pid: u32, filter: Option<String>) -> Result<()> {
