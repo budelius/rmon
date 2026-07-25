@@ -40,6 +40,10 @@ installer:
     - choco install -y wixtoolset --no-progress
     - Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
     - refreshenv
+    # `refreshenv` re-reads PATH from the registry, which wipes out the
+    # cargo bin entry `before_script` added (rustup was installed with
+    # --no-modify-path, so it was never persisted there) -- re-add it.
+    - $env:Path += ";$env:USERPROFILE\.cargo\bin"
     - cargo install cargo-wix --locked
     - cargo wix -p rmon-gui --nocapture
   artifacts:
