@@ -173,6 +173,17 @@ stack.
 
 ## Building a Windows installer
 
+**Download the latest build:** every push to `master` runs the `installer`
+CI job on a GitLab.com Windows SaaS runner and publishes the resulting
+`.msi` as a job artifact, so the latest one is always at:
+<https://gitlab.com/martin-wieser/rmon/-/jobs/artifacts/master/download?job=installer>
+(no login needed -- the project is public). See `.gitlab-ci.yml`: the
+`build` job compiles, tests, and clippy-checks the whole workspace (on
+merge requests and `master`); `installer` additionally installs the WiX
+Toolset via Chocolatey and runs `cargo wix` (`master` only).
+
+To build one locally instead:
+
 `crates/rmon-gui` is set up for [cargo-wix](https://github.com/volks73/cargo-wix)
 to produce a `.msi`:
 

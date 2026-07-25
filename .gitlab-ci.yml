@@ -1,0 +1,51 @@
+# rMon is Windows-only (rmon-core links against native Win32/WMI/NVML
+# APIs), so everything runs on GitLab.com's SaaS Windows runners rather
+# than cross-compiling from Linux -- that also lets `cargo test` actually
+# execute the real Windows-API-touching tests, not just compile them.
+
+stages:
+  - build
+  - package
+
+.windows_rust:
+  tags:
+    - saas-windows-medium-amd64
+  before_script:
+    # Rust isn't preinstalled on the Windows SaaS runner image; bootstrap it
+    # the same way a real dev machine would.
+    - Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+    - .\rustup-init.exe -y --default-toolchain stable-x86_64-pc-windows-msvc --no-modify-path
+    - $env:Path += ";$env:USERPROFILE\.cargo\bin"
+    - rustc --version
+    - cargo --version
+
+build:
+  extends: .windows_rust
+  stage: build
+  script:
+    - cargo build --workspace --all-targets
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Builds the release .msi and publishes it as a job artifact so there's
+# always a stable "latest installer" download link for the default branch:
+#   https://gitlab.com/martin-wieser/rmon/-/jobs/artifacts/master/download?job=installer
+installer:
+  extends: .windows_rust
+  stage: package
+  script:
+    - choco install -y wixtoolset --no-progress
+    - Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+    - refreshenv
+    - cargo install cargo-wix --locked
+    - cargo wix -p rmon-gui --nocapture
+  artifacts:
+    name: "rmon-installer-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/wix/*.msi
+    expire_in: never
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
