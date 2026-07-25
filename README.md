@@ -44,6 +44,7 @@ cargo run -p rmon-tui
 
 # Live desktop dashboard (has its own "record to SQLite" toggle)
 cargo run -p rmon-gui
+cargo run -p rmon-gui -- --minimized   # start hidden in the tray (used by autostart)
 ```
 
 Both live dashboards show, per process: current CPU%/GPU% plus an inline
@@ -69,6 +70,16 @@ Two independent axes, both available in the CLI (`--tree`/`--subtree`), TUI
   descendants* — so e.g. a browser's main process outranks unrelated
   processes based on the total usage of all its renderer/GPU-process
   children, not just its own (often near-zero) share.
+
+In the GUI, the process table's column headers (PID, Name, CPU%, GPU%, Src)
+are also independently clickable: clicking one sorts by that column, and a
+▲/▼ marks the active one — click again to reverse direction. This is on top
+of, not instead of, the header buttons above (which drive the CPU%/GPU%
+metric and instant/accumulated window); clicking a CPU% or GPU% column
+header is equivalent to clicking the matching button. Columns are also
+individually resizable by dragging their border. Clicking anywhere on a row
+selects it (not just the PID cell), and `↑`/`↓` move the selection up/down
+through the current row order once no text field has focus.
 
 ### Open files
 
@@ -101,6 +112,24 @@ process's files · `/` search (Enter to keep, Esc to clear) · `r` rescan
 (files view) · `Esc` back to the process view (or quit, from the process
 view) · `q` quit.
 
+### Tray icon and autostart (GUI)
+
+`rmon-gui` has a system tray icon so it can keep sampling (and recording, if
+enabled) in the background instead of quitting: closing the window (✕)
+hides it to the tray rather than exiting; left-clicking the tray icon or its
+"Show rMon" menu item brings the window back, and "Quit" is the only way to
+actually terminate the process. The tray icon is drawn procedurally at
+startup (no icon asset needed) and if tray creation fails for any reason
+(e.g. no tray support on the platform), the app falls back to the window's
+✕ actually quitting.
+
+The "start with Windows" checkbox in the header writes (or removes) a
+per-user `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry
+pointing at the current executable with `--minimized` — no Administrator
+rights needed, and unchecking it fully reverses it. A `--minimized` launch
+starts with the window hidden, straight into the tray, so logging in
+doesn't pop a window up.
+
 ## Temperature and throttle telemetry
 
 - **GPU** (NVIDIA only, via NVML): per-GPU temperature and whether NVML
@@ -130,3 +159,34 @@ per-process lookups. `rmon-core::build_tree` turns a flat process list into
 a depth-first parent/child ordering for the tree view, optionally ranked by
 subtree-total usage instead of each process's own. `rmon-core::list_open_files`
 does the on-demand kernel-handle-table walk behind the Files view.
+
+## Diagnostics (crash reporting)
+
+All three binaries call `rmon_core::observability::init_sentry()` at
+startup and report panics/errors to Sentry/rustrak, plus structured events
+to ELK. This is env-var driven and a no-op until `SENTRY_DSN` (and/or
+`ELASTICSEARCH_HOST`) is set — see `crates/rmon-core/OBSERVABILITY.md` for
+the full list of environment variables and write transports. The module was
+scaffolded with [ojiichan](https://gitlab.com/martin-wieser/ojiichan) so it
+follows the same conventions as the Python services reporting to the same
+stack.
+
+## Building a Windows installer
+
+`crates/rmon-gui` is set up for [cargo-wix](https://github.com/volks73/cargo-wix)
+to produce a `.msi`:
+
+```powershell
+cargo install cargo-wix        # once
+# then install the WiX Toolset v3 (candle.exe/light.exe), e.g.:
+winget install --id WiXToolset.WiXToolset
+
+cargo wix -p rmon-gui           # from the repo root; installer lands in target\wix\
+```
+
+The exe's icon (`crates/rmon-gui/assets/rmon.ico`) is embedded as a Win32
+resource by `build.rs` (via `winresource`) and also used for the Start Menu
+shortcut the installer creates. `crates/rmon-gui/examples/gen_icon.rs`
+regenerates that `.ico` from the same procedural design as the tray/window
+icon (`src/icon.rs`) if you ever change it — run
+`cargo run -p rmon-gui --example gen_icon` and re-commit the result.
