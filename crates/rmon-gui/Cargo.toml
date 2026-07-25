@@ -3,6 +3,8 @@ name = "rmon-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors = ["budelius"]
+description = "rMon: a live process CPU/GPU monitor"
 
 [[bin]]
 name = "rmon-gui"
@@ -15,3 +17,11 @@ eframe = "0.35.0"
 egui_extras = "0.35.0"
 egui_plot = "0.36.0"
 rmon-core = { version = "0.1.0", path = "../rmon-core" }
+tray-icon = "0.24.1"
+winreg = "0.56.0"
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[dev-dependencies]
+ico = "0.5.0"
