@@ -32,4 +32,4 @@ pub use ports::{list_all_ports, listening_ports_for, PortEntry, Protocol, TcpSta
 pub use proc_events::{RecentExit, ShortLivedWatcher};
 pub use sampler::Sampler;
 pub use storage::Store;
-pub use tree::build_tree;
+pub use tree::{build_tree, merge_recent_exits, DEFAULT_GHOST_MAX_DEPTH};

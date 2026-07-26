@@ -12,9 +12,10 @@ use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use rmon_core::{
     build_tree, check_hardware_health, list_all_ports, list_open_files, list_open_files_many,
-    listening_ports_for, AllFilesEntry, GpuSource, HardwareHealthReport, OpenFilesScan, PortEntry,
-    ProcessSample, RollingHistory, Sampler, ShortLivedWatcher, Store, SystemMetrics,
-    DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS,
+    listening_ports_for, merge_recent_exits, AllFilesEntry, GpuSource, HardwareHealthReport,
+    OpenFilesScan, PortEntry, ProcessSample, RollingHistory, Sampler, ShortLivedWatcher, Store,
+    SystemMetrics, DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
+    DEFAULT_WHEA_MAX_EVENTS,
 };
 use tray::{Tray, TrayAction};
 
@@ -248,6 +249,11 @@ struct RmonApp {
     /// Recomputed every `resort()` regardless of `orphans_only`, so rows
     /// can be badged even when the filter itself is off.
     orphan_pids: HashSet<u32>,
+    /// Pids in the current tree layout that are synthetic "ghost" nodes —
+    /// exited processes reconnected from `ShortLivedWatcher`'s history via
+    /// `merge_recent_exits`, not real live rows (see `resort`). Always
+    /// empty in flat view.
+    tree_ghosts: HashSet<u32>,
     rows: Vec<(usize, ProcessSample)>,
     /// Pids whose children are hidden in tree view.
     collapsed: HashSet<u32>,
@@ -317,6 +323,7 @@ impl RmonApp {
             filter: String::new(),
             orphans_only: false,
             orphan_pids: HashSet::new(),
+            tree_ghosts: HashSet::new(),
             rows: Vec::new(),
             collapsed: HashSet::new(),
             tree_has_children: HashSet::new(),
@@ -416,6 +423,7 @@ impl RmonApp {
         self.rows = match self.view_mode {
             ViewMode::Flat => {
                 self.tree_has_children.clear();
+                self.tree_ghosts.clear();
                 let mut v = filtered;
                 v.sort_by(|a, b| {
                     let ord = match column {
@@ -433,10 +441,20 @@ impl RmonApp {
                 v.into_iter().map(|p| (0, p)).collect()
             }
             ViewMode::Tree => {
+                // Reconnect orphans to a recently-exited real parent when
+                // possible (`ShortLivedWatcher` records each process's
+                // ppid at the moment it started, so it survives the
+                // parent exiting) instead of promoting every orphan
+                // straight to a root.
+                let recent_exits = self.short_lived.as_ref().map(|w| w.recent()).unwrap_or_default();
+                let (augmented, ghosts) =
+                    merge_recent_exits(&filtered, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
+                self.tree_ghosts = ghosts;
+
                 // build_tree always ranks descending by key; negate to flip to ascending.
                 let sign = if ascending { -1.0 } else { 1.0 };
                 let key = |p: &ProcessSample| sign * score(history, metric, window, p);
-                let full = build_tree(&filtered, key, self.subtree_sort);
+                let full = build_tree(&augmented, key, self.subtree_sort);
 
                 self.tree_has_children.clear();
                 for w in full.windows(2) {
@@ -971,6 +989,7 @@ impl RmonApp {
                 let has_children = &self.tree_has_children;
                 let collapsed = &self.collapsed;
                 let orphan_pids = &self.orphan_pids;
+                let tree_ghosts = &self.tree_ghosts;
                 body.rows(20.0, rows.len(), |mut row| {
                     let (depth, p) = &rows[row.index()];
                     let selected = selected_pid == Some(p.pid);
@@ -1000,7 +1019,15 @@ impl RmonApp {
                                     ui.add_space(14.0);
                                 }
                             }
-                            ui.label(&p.name);
+                            if tree_ghosts.contains(&p.pid) {
+                                ui.weak(&p.name).on_hover_text(
+                                    "exited — reconstructed from ETW process tracking, \
+                                     no CPU/GPU history was ever sampled for it",
+                                );
+                                ui.colored_label(egui::Color32::from_rgb(140, 140, 150), "👻 exited");
+                            } else {
+                                ui.label(&p.name);
+                            }
                             if orphan_pids.contains(&p.pid) {
                                 ui.colored_label(egui::Color32::from_rgb(230, 180, 0), "⚠ orphan")
                                     .on_hover_text("parent process has already exited");

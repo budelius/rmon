@@ -144,6 +144,29 @@ once, not just the selected one:
   once. Same best-effort rules as the single-process Files view apply per
   process (inaccessible processes are skipped, not fatal).
 
+### Historic process tree (exited parents)
+
+A live snapshot's `ppid` breaks the moment a parent exits — its children
+just become orphans (badged `⚠ orphan`) with no record of who they used to
+belong to. Tree view fixes this when it can: rMon tracks process
+start/exit via the `Microsoft-Windows-Kernel-Process` ETW provider (needs
+Administrator), which records each process's parent PID *at the moment it
+started* rather than reading it live — so that record survives the parent
+dying. When building the tree, `rmon-core::merge_recent_exits` walks an
+orphan's parent chain through that exit history (up to 8 hops back,
+`DEFAULT_GHOST_MAX_DEPTH`) and reconnects it under synthetic "ghost" nodes
+for any exited ancestors it can identify, instead of promoting every
+orphan straight to a root. Ghost nodes render dimmed with a "👻 exited"
+marker (GUI and TUI) — they have no CPU/GPU history, since they were never
+actually sampled.
+
+This only works going forward: a chain can only be reconstructed for
+processes whose entire start-to-exit lifetime happened while rMon was
+running elevated. It can't recover lineage from before that — Windows
+doesn't retain process-parentage history by default (Sysmon or Windows'
+own Process Creation auditing, event 4688, are the standard ways to get
+that further back, neither of which rMon uses today).
+
 ### Hardware health (WHEA events, BIOS, microcode)
 
 Accurate temperature alone never confirms silicon degradation — that's
@@ -254,7 +277,10 @@ minutes of raw samples for the live charts/sparklines, plus a 1-minute-
 bucketed accumulator good for up to 24h) indexed by pid so both are O(1)
 per-process lookups. `rmon-core::build_tree` turns a flat process list into
 a depth-first parent/child ordering for the tree view, optionally ranked by
-subtree-total usage instead of each process's own. `rmon-core::list_open_files`
+subtree-total usage instead of each process's own. `rmon-core::merge_recent_exits`
+runs before `build_tree` to splice in synthetic "ghost" nodes for exited
+ancestors reconnected from ETW-tracked exit history (see "Historic process
+tree" above). `rmon-core::list_open_files`
 does the on-demand kernel-handle-table walk behind the Files view (fanned
 out across every process by `list_open_files_many`, behind the cross-process
 search). `rmon-core::list_all_ports` reads the system-wide TCP/UDP table

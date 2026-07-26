@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -14,9 +14,10 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use rmon_core::{
     build_tree, check_hardware_health, list_all_ports, list_open_files, list_open_files_many,
-    listening_ports_for, AllFilesEntry, GpuSource, HardwareHealthReport, OpenFilesScan, PortEntry,
-    ProcessSample, RollingHistory, Sampler, SystemMetrics, DEFAULT_SCAN_WORKERS,
-    DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS,
+    listening_ports_for, merge_recent_exits, AllFilesEntry, GpuSource, HardwareHealthReport,
+    OpenFilesScan, PortEntry, ProcessSample, RollingHistory, Sampler, ShortLivedWatcher,
+    SystemMetrics, DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
+    DEFAULT_WHEA_MAX_EVENTS,
 };
 
 const RETAIN: Duration = Duration::from_secs(300);
@@ -398,6 +399,15 @@ struct App {
     files: Option<FilesState>,
     search_all: SearchState,
     health: Option<HealthState>,
+    /// Best-effort ETW process start/exit tracking (needs Administrator);
+    /// `None` if unavailable. Used only to reconnect exited parents in the
+    /// tree view (see `resort`) — there's no dedicated "recently exited"
+    /// view in the TUI the way there is in the GUI.
+    short_lived: Option<ShortLivedWatcher>,
+    /// Pids in the current tree layout that are synthetic "ghost" nodes
+    /// from `short_lived`'s history, not real live rows. Always empty in
+    /// flat view.
+    tree_ghosts: HashSet<u32>,
 }
 
 impl App {
@@ -427,6 +437,8 @@ impl App {
             files: None,
             search_all: SearchState::new(),
             health: None,
+            short_lived: ShortLivedWatcher::start().ok(),
+            tree_ghosts: HashSet::new(),
         }
     }
 
@@ -457,11 +469,23 @@ impl App {
 
         self.rows = match self.view_mode {
             ViewMode::Flat => {
+                self.tree_ghosts.clear();
                 let mut v = filtered;
                 v.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
                 v.into_iter().map(|p| (0, p)).collect()
             }
-            ViewMode::Tree => build_tree(&filtered, key, self.subtree_sort),
+            ViewMode::Tree => {
+                // Reconnect orphans to a recently-exited real parent when
+                // possible (`ShortLivedWatcher` records each process's
+                // ppid at the moment it started, so it survives the
+                // parent exiting) instead of promoting every orphan
+                // straight to a root.
+                let recent_exits = self.short_lived.as_ref().map(|w| w.recent()).unwrap_or_default();
+                let (augmented, ghosts) =
+                    merge_recent_exits(&filtered, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
+                self.tree_ghosts = ghosts;
+                build_tree(&augmented, key, self.subtree_sort)
+            }
         };
 
         // Keep the same process selected across re-sorts when possible.
@@ -1151,20 +1175,27 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             GpuSource::Pdh => "pdh",
             GpuSource::Unavailable => "-",
         };
+        let is_ghost = app.tree_ghosts.contains(&p.pid);
         let tail = app.history.tail_for_pid(p.pid, SPARK_POINTS);
         let cpu_spark = sparkline(&tail.iter().map(|(c, _)| *c).collect::<Vec<_>>());
         let gpu_spark = sparkline(&tail.iter().map(|(_, g)| *g).collect::<Vec<_>>());
 
         let indent = "  ".repeat(*depth);
-        let name = format!("{indent}{}{}", if *depth > 0 { "└ " } else { "" }, p.name);
+        let marker = if is_ghost { " 👻 exited" } else { "" };
+        let name = format!("{indent}{}{}{marker}", if *depth > 0 { "└ " } else { "" }, p.name);
 
-        Row::new(vec![
+        let row = Row::new(vec![
             Cell::from(p.pid.to_string()),
             Cell::from(name),
             Cell::from(format!("{:>5.1} {cpu_spark}", p.cpu_percent)),
             Cell::from(format!("{:>5.1} {gpu_spark}", p.gpu_percent)),
             Cell::from(src),
-        ])
+        ]);
+        if is_ghost {
+            row.style(Style::default().fg(Color::DarkGray))
+        } else {
+            row
+        }
     });
 
     let widths = [

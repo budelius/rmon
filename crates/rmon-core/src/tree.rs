@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::model::ProcessSample;
+use crate::model::{GpuSource, ProcessSample};
+use crate::proc_events::RecentExit;
 
 /// Builds a parent/child process tree from a flat process list and flattens
 /// it into a depth-first, pre-order sequence: top-level processes (whose
@@ -67,6 +68,84 @@ where
         }
     }
     out
+}
+
+/// Default hop cap for `merge_recent_exits` — enough to reconstruct a
+/// chain of several exited ancestors without risking runaway work if the
+/// recent-exits list happens to contain a long, mostly-unrelated chain.
+pub const DEFAULT_GHOST_MAX_DEPTH: usize = 8;
+
+/// Synthesizes a "ghost" `ProcessSample` for every exited process that a
+/// live process still points to as its `ppid` (via `RecentExit`, which
+/// records each process's parent PID *at the moment it started* — see
+/// `proc_events.rs` — so it survives the parent exiting, unlike a live
+/// snapshot's `ppid`). Walks up the exited chain (parent, grandparent, ...)
+/// up to `max_depth` hops, so `build_tree` can reconnect a whole recently-
+/// exited ancestor chain instead of promoting every orphan straight to a
+/// root.
+///
+/// Returns the original processes plus one synthetic entry per reconnected
+/// ghost, and the set of pids that are ghosts (zero CPU/GPU history was
+/// ever sampled for them — callers should render them distinctly, e.g.
+/// grayed out, and not offer actions like "kill" that assume it's alive).
+/// A ghost whose own parent can't be resolved (chain exhausted, hit
+/// `max_depth`, or no matching exit record) just becomes a root in the
+/// resulting tree — the same fallback as today's un-augmented behavior.
+pub fn merge_recent_exits(
+    processes: &[ProcessSample],
+    exited: &[RecentExit],
+    max_depth: usize,
+) -> (Vec<ProcessSample>, HashSet<u32>) {
+    let live_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+
+    // `exited` is newest-first (see `ShortLivedWatcher::recent`); keep only
+    // the newest record per pid in case a pid was reused and exited more
+    // than once.
+    let mut exited_by_pid: HashMap<u32, &RecentExit> = HashMap::new();
+    for e in exited {
+        exited_by_pid.entry(e.pid).or_insert(e);
+    }
+
+    let mut augmented = processes.to_vec();
+    let mut ghosts: HashSet<u32> = HashSet::new();
+
+    let mut to_check: Vec<u32> = processes
+        .iter()
+        .filter_map(|p| p.ppid)
+        .filter(|ppid| !live_pids.contains(ppid))
+        .collect();
+
+    let mut depth = 0;
+    while depth < max_depth && !to_check.is_empty() {
+        let mut next = Vec::new();
+        for pid in to_check.drain(..) {
+            if ghosts.contains(&pid) || live_pids.contains(&pid) {
+                continue;
+            }
+            let Some(exit) = exited_by_pid.get(&pid) else {
+                continue;
+            };
+            ghosts.insert(pid);
+            augmented.push(ProcessSample {
+                pid,
+                ppid: exit.ppid,
+                name: exit.name.clone(),
+                cpu_percent: 0.0,
+                gpu_percent: 0.0,
+                gpu_source: GpuSource::Unavailable,
+                user: None,
+                command_line: None,
+                handle_count: None,
+            });
+            if let Some(grandparent) = exit.ppid {
+                next.push(grandparent);
+            }
+        }
+        to_check = next;
+        depth += 1;
+    }
+
+    (augmented, ghosts)
 }
 
 /// pid -> (own key + sum of all descendants' keys), computed bottom-up.
@@ -186,5 +265,56 @@ mod tests {
         let tree = build_tree(&procs, |p| p.cpu_percent, true);
         let top_level: Vec<u32> = tree.iter().filter(|(d, _)| *d == 0).map(|(_, p)| p.pid).collect();
         assert_eq!(top_level, vec![1, 10]);
+    }
+
+    fn exit(pid: u32, ppid: Option<u32>, name: &str) -> RecentExit {
+        RecentExit {
+            pid,
+            ppid,
+            name: name.to_string(),
+            start_time: chrono::Utc::now(),
+            duration_ms: 0,
+            exit_code: Some(0),
+        }
+    }
+
+    #[test]
+    fn merge_recent_exits_reconnects_orphan_to_dead_parent() {
+        // pid 2's live ppid (99) isn't in the live list, but exited history
+        // says 99's own parent was 1 (still alive) — so 99 should be
+        // reconnected as a ghost between 1 and 2.
+        let procs = vec![proc(1, None, 1.0), proc(2, Some(99), 1.0)];
+        let exited = vec![exit(99, Some(1), "dead-parent")];
+        let (augmented, ghosts) = merge_recent_exits(&procs, &exited, DEFAULT_GHOST_MAX_DEPTH);
+        assert_eq!(ghosts, HashSet::from([99]));
+        let tree = build_tree(&augmented, |p| p.cpu_percent, false);
+        let pids_and_depths: Vec<(u32, usize)> = tree.iter().map(|(d, p)| (p.pid, *d)).collect();
+        assert_eq!(pids_and_depths, vec![(1, 0), (99, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn merge_recent_exits_leaves_orphan_alone_without_a_matching_record() {
+        // pid 2's parent (99) isn't live and has no exit record — falls
+        // back to today's behavior: no ghost synthesized, pid 2 becomes a
+        // root once passed through `build_tree`.
+        let procs = vec![proc(2, Some(99), 1.0)];
+        let (augmented, ghosts) = merge_recent_exits(&procs, &[], DEFAULT_GHOST_MAX_DEPTH);
+        assert!(ghosts.is_empty());
+        assert_eq!(augmented.len(), 1);
+    }
+
+    #[test]
+    fn merge_recent_exits_respects_max_depth() {
+        // A longer dead chain: 2's parent is 99, 99's parent is 98, 98's
+        // parent is 97 (all exited). With max_depth 1, only the immediate
+        // dead parent (99) is reconnected, not further back.
+        let procs = vec![proc(2, Some(99), 1.0)];
+        let exited = vec![
+            exit(99, Some(98), "a"),
+            exit(98, Some(97), "b"),
+            exit(97, None, "c"),
+        ];
+        let (_augmented, ghosts) = merge_recent_exits(&procs, &exited, 1);
+        assert_eq!(ghosts, HashSet::from([99]));
     }
 }
