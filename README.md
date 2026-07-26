@@ -158,7 +158,9 @@ orphan's parent chain through that exit history (up to 8 hops back,
 for any exited ancestors it can identify, instead of promoting every
 orphan straight to a root. Ghost nodes render dimmed with a "👻 exited"
 marker (GUI and TUI) — they have no CPU/GPU history, since they were never
-actually sampled.
+actually sampled. The MCP server's `process_tree` tool does the same
+reconnection (`"is_ghost": true` on those rows), and its `recent_exits`
+tool exposes the raw exit history directly.
 
 This only works going forward: a chain can only be reconstructed for
 processes whose entire start-to-exit lifetime happened while rMon was
@@ -247,10 +249,17 @@ stdio (via the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK),
 so any MCP client — Claude Desktop, Claude Code, etc. — can query a running
 system's process/network/file state directly, without a GUI/TUI open. Add
 it to a client's MCP server config the normal way, pointing at
-`rmon mcp` (or the built `rmon.exe mcp`). It exposes seven read-only tools:
+`rmon mcp` (or the built `rmon.exe mcp`). It exposes eight read-only tools:
 
 - `snapshot` — process list ranked by combined CPU%+GPU%, plus system-wide totals.
-- `process_tree` — the same, as a parent/child tree (optionally ranked by subtree totals).
+- `process_tree` — the same, as a parent/child tree (optionally ranked by subtree totals). Also
+  reconnects exited parents via ETW exit history the same way the GUI/TUI tree views do (see
+  "Historic process tree" above) — reconnected rows carry `"is_ghost": true` and have no
+  CPU/GPU data, since they were never actually sampled.
+- `recent_exits` — the raw ETW-tracked exit history `process_tree` reconnects orphans from:
+  every process that started and fully exited since the MCP server itself started, with
+  wall-clock duration and exit code. Needs Administrator; reports why it's unavailable
+  otherwise rather than silently returning nothing.
 - `process_detail` — one pid's basic info, open handle count, open files, and listening ports.
 - `list_ports` — TCP/UDP endpoints system-wide or for one pid, with optional listening-only/substring filtering.
 - `search_open_files` — substring search over open file paths across every process.

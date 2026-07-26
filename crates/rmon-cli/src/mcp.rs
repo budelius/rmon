@@ -10,9 +10,17 @@
 //! dedicated thread for the server's whole lifetime, and every tool call
 //! reaches it through a request/response channel instead of touching it
 //! directly.
+//!
+//! `process_tree` also reconnects exited parents (via `ShortLivedWatcher`'s
+//! ETW-tracked exit history, same as the GUI/TUI tree views) so an MCP
+//! client sees the same historic lineage a human would in the GUI, not
+//! just orphans. `ShortLivedWatcher` needs Administrator elevation; if
+//! that fails, `process_tree` silently falls back to today's live-only
+//! behavior and `recent_exits` reports the failure reason.
 
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
@@ -21,8 +29,9 @@ use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError, ServiceExt};
 use rmon_core::{
     build_tree, check_hardware_health, handle_count, list_all_ports, list_open_files,
-    list_open_files_many, listening_ports_for, PortEntry, ProcessSample, Sampler, Snapshot,
-    SystemMetrics, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS,
+    list_open_files_many, listening_ports_for, merge_recent_exits, PortEntry, ProcessSample,
+    Sampler, ShortLivedWatcher, Snapshot, SystemMetrics, DEFAULT_GHOST_MAX_DEPTH,
+    DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -161,6 +170,11 @@ enum SamplerMsg {
 #[derive(Clone)]
 struct RmonMcpServer {
     tx: std_mpsc::Sender<SamplerMsg>,
+    /// `Arc` (not just `Option<ShortLivedWatcher>`) because the tool
+    /// router requires `Self: Clone`, and the ETW trace session inside
+    /// `ShortLivedWatcher` isn't cloneable itself — only shareable.
+    short_lived: Option<Arc<ShortLivedWatcher>>,
+    short_lived_error: Option<Arc<str>>,
 }
 
 #[tool_router(server_handler)]
@@ -178,7 +192,11 @@ impl RmonMcpServer {
                 }
             }
         });
-        Self { tx }
+        let (short_lived, short_lived_error) = match ShortLivedWatcher::start() {
+            Ok(w) => (Some(Arc::new(w)), None),
+            Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
+        };
+        Self { tx, short_lived, short_lived_error }
     }
 
     /// Takes a fresh sample from the dedicated sampler thread. CPU%/GPU% on
@@ -218,15 +236,18 @@ impl RmonMcpServer {
     }
 
     #[tool(
-        description = "Process list as a parent/child tree (depth-first; each row includes its tree depth), ranked by combined CPU%+GPU% usage."
+        description = "Process list as a parent/child tree (depth-first; each row includes its tree depth), ranked by combined CPU%+GPU% usage. Reconnects orphans under exited parents when ETW exit history (see `recent_exits`) can identify one, instead of promoting every orphan to a root — those rows have `is_ghost: true`, zero CPU/GPU (they were never sampled), and only exist going forward from whenever this server's process-exit tracking started (needs Administrator; see `recent_exits`)."
     )]
     async fn process_tree(
         &self,
         Parameters(args): Parameters<TreeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let snap = self.snapshot_now().await;
+        let recent_exits = self.short_lived.as_ref().map(|w| w.recent()).unwrap_or_default();
+        let (augmented, ghosts) =
+            merge_recent_exits(&snap.processes, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
         let key = |p: &ProcessSample| p.cpu_percent + p.gpu_percent;
-        let mut rows = build_tree(&snap.processes, key, args.subtree_totals);
+        let mut rows = build_tree(&augmented, key, args.subtree_totals);
         if let Some(top) = args.top {
             rows.truncate(top);
         }
@@ -235,10 +256,43 @@ impl RmonMcpServer {
             .map(|(depth, p)| {
                 let mut v = process_json(p);
                 v["depth"] = json!(depth);
+                v["is_ghost"] = json!(ghosts.contains(&p.pid));
                 v
             })
             .collect();
         text_result(&json!(value))
+    }
+
+    #[tool(
+        description = "Processes that started and fully exited since this MCP server started, via ETW (Microsoft-Windows-Kernel-Process provider) — catches short-lived processes a point-in-time snapshot would miss entirely, and is what lets `process_tree` reconnect orphans to a real exited parent. Needs Administrator; if unavailable, `available` is false and `error` explains why. Duration is wall-clock, not CPU time — these events don't carry CPU usage."
+    )]
+    async fn recent_exits(&self) -> Result<CallToolResult, McpError> {
+        let Some(watcher) = &self.short_lived else {
+            return text_result(&json!({
+                "available": false,
+                "error": self.short_lived_error.as_deref(),
+                "exits": [],
+            }));
+        };
+        let exits = watcher.recent();
+        let value: Vec<_> = exits
+            .iter()
+            .map(|e| {
+                json!({
+                    "pid": e.pid,
+                    "ppid": e.ppid,
+                    "name": e.name,
+                    "start_time": e.start_time.to_rfc3339(),
+                    "duration_ms": e.duration_ms,
+                    "exit_code": e.exit_code,
+                })
+            })
+            .collect();
+        text_result(&json!({
+            "available": true,
+            "error": null,
+            "exits": value,
+        }))
     }
 
     #[tool(
