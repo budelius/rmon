@@ -30,8 +30,8 @@ build:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
-# Builds the release .msi and publishes it as a job artifact so there's
-# always a stable "latest installer" download link for the default branch:
+# Builds the release CLI and .msi, then publishes both as job artifacts so
+# there are stable "latest" downloads for the default branch:
 #   https://gitlab.com/martin-wieser/rmon/-/jobs/artifacts/master/download?job=installer
 installer:
   extends: .windows_rust
@@ -45,10 +45,14 @@ installer:
     # --no-modify-path, so it was never persisted there) -- re-add it.
     - $env:Path += ";$env:USERPROFILE\.cargo\bin"
     - cargo install cargo-wix --locked
+    # cargo-wix builds the GUI package, but the installer also contains the
+    # CLI used for snapshot/ports/search/MCP, so build that release binary first.
+    - cargo build --release -p rmon-cli
     - cargo wix -p rmon-gui --nocapture
   artifacts:
-    name: "rmon-installer-$CI_COMMIT_SHORT_SHA"
+    name: "rmon-windows-$CI_COMMIT_SHORT_SHA"
     paths:
+      - target/release/rmon.exe
       - target/wix/*.msi
     expire_in: never
   rules:

@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -35,7 +36,9 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION,
+    GetCurrentProcess, GetProcessHandleCount, OpenProcess, OpenProcessToken, TerminateProcess,
+    PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
 };
 
 const PROCESS_HANDLE_INFORMATION_CLASS: u32 = 51; // ProcessHandleInformation
@@ -46,6 +49,36 @@ const NAME_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
 /// Hard cap on handles inspected per scan so a process with an
 /// unreasonably large handle table can't make this run away.
 const MAX_HANDLES: usize = 20_000;
+
+/// Cheap total open-handle count for `pid` (all handle types, not just
+/// files) via a single `GetProcessHandleCount` call — unlike
+/// `list_open_files`, this is safe to poll for a process every tick.
+pub fn handle_count(pid: u32) -> Option<u32> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut count = 0u32;
+        let status = GetProcessHandleCount(process, &mut count);
+        let _ = CloseHandle(process);
+        status.ok()?;
+        Some(count)
+    }
+}
+
+/// Terminates `pid` outright (`TerminateProcess`, exit code 1) — the same
+/// operation as Task Manager's "End task". Best-effort elevation via
+/// `SeDebugPrivilege` so this can reach processes owned by other users when
+/// rMon itself is running elevated.
+pub fn kill_process(pid: u32) -> Result<()> {
+    enable_debug_privilege();
+    unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE, false, pid).with_context(|| {
+            format!("OpenProcess({pid}, PROCESS_TERMINATE) failed — try running rMon as Administrator")
+        })?;
+        let result = TerminateProcess(process, 1).context("TerminateProcess failed");
+        let _ = CloseHandle(process);
+        result
+    }
+}
 
 pub struct OpenFilesScan {
     pub paths: Vec<String>,
@@ -129,6 +162,54 @@ pub fn list_open_files(pid: u32) -> Result<OpenFilesScan> {
         let _ = CloseHandle(process);
     }
     result
+}
+
+/// Default number of processes scanned concurrently by
+/// `list_open_files_many` — bounds how many of these (potentially
+/// handle-table-sized) scans run at once, independent of how many threads
+/// any single scan spawns internally for its own handle-name queries.
+pub const DEFAULT_SCAN_WORKERS: usize = 8;
+
+/// One process's result from a `list_open_files_many` batch.
+pub struct AllFilesEntry {
+    pub pid: u32,
+    pub scan: Result<OpenFilesScan, String>,
+}
+
+/// Runs `list_open_files` for every pid in `pids`, using up to `workers`
+/// concurrent worker threads (see `DEFAULT_SCAN_WORKERS`), and streams one
+/// `AllFilesEntry` per pid to `tx` as each scan completes.
+///
+/// This is the "search open files across all processes" primitive: it's
+/// just `list_open_files` fanned out, so it inherits the same on-demand,
+/// best-effort characteristics (processes rMon can't open — other users',
+/// protected, without `SeDebugPrivilege` — simply come back as an error for
+/// that one pid rather than failing the whole batch). Blocks the calling
+/// thread until every pid has been scanned, so callers normally run this on
+/// a background thread, same as a single `list_open_files` call.
+pub fn list_open_files_many(pids: Vec<u32>, workers: usize, tx: mpsc::Sender<AllFilesEntry>) {
+    let queue = Arc::new(Mutex::new(pids));
+    let mut threads = Vec::new();
+    for _ in 0..workers.max(1) {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        threads.push(std::thread::spawn(move || {
+            loop {
+                let pid = {
+                    let mut q = queue.lock().expect("scan queue mutex poisoned");
+                    q.pop()
+                };
+                let Some(pid) = pid else { break };
+                let scan = list_open_files(pid).map_err(|e| e.to_string());
+                if tx.send(AllFilesEntry { pid, scan }).is_err() {
+                    break; // receiver dropped; no point continuing this worker
+                }
+            }
+        }));
+    }
+    for t in threads {
+        let _ = t.join();
+    }
 }
 
 unsafe fn nt_query_information_process(process: HANDLE, buf: &mut [u8], ret_len: &mut u32) -> i32 {

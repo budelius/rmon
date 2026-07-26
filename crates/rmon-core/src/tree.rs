@@ -124,6 +124,9 @@ mod tests {
             cpu_percent: cpu,
             gpu_percent: 0.0,
             gpu_source: GpuSource::Unavailable,
+            user: None,
+            command_line: None,
+            handle_count: None,
         }
     }
 

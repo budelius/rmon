@@ -53,17 +53,21 @@ impl Sampler {
                     cpu_percent: info.cpu_percent,
                     gpu_percent,
                     gpu_source,
+                    user: info.user,
+                    command_line: info.command_line,
+                    handle_count: None,
                 }
             })
             .collect();
 
-        let (cpu_temp_c, cpu_clock_ratio) = self.thermal.sample();
+        let (cpu_temp_c, cpu_temp_source, cpu_clock_ratio) = self.thermal.sample();
         let global_load = self.cpu.global_usage();
         let cpu_throttled = cpu_clock_ratio
             .is_some_and(|r| r < CPU_THROTTLE_CLOCK_RATIO && global_load > CPU_THROTTLE_MIN_LOAD);
 
         let system = SystemMetrics {
             cpu_temp_c,
+            cpu_temp_source: cpu_temp_source.map(str::to_string),
             cpu_clock_ratio,
             cpu_throttled,
             gpus: self.gpu.telemetry(),

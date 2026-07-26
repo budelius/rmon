@@ -45,20 +45,31 @@ impl CpuThermalMonitor {
         Self { acpi, cimv2 }
     }
 
-    /// Returns (avg CPU temp °C, avg clock ratio 0..=1). Whether that
-    /// amounts to "throttled" depends on concurrent load, which callers
-    /// combine this with (see `Sampler`).
-    pub fn sample(&self) -> (Option<f32>, Option<f32>) {
-        let temp_c = self.acpi.as_ref().and_then(|conn| {
-            let rows: Vec<AcpiThermalZone> = conn
-                .raw_query("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
-                .ok()?;
-            average(
-                rows.iter()
-                    .map(|r| r.CurrentTemperature as f32 / 10.0 - 273.15)
-                    .filter(|c| (-50.0..150.0).contains(c)),
-            )
-        });
+    /// Returns (avg CPU temp °C, temp source label, avg clock ratio 0..=1).
+    /// Whether the temp amounts to "throttled" depends on concurrent load,
+    /// which callers combine this with (see `Sampler`).
+    ///
+    /// Prefers real per-core/package readings from HWiNFO's Shared Memory
+    /// Support (when HWiNFO is running with it enabled) over the ACPI
+    /// thermal zone, which is frequently absent, inaccurate, or not
+    /// actually the CPU package on many systems.
+    pub fn sample(&self) -> (Option<f32>, Option<&'static str>, Option<f32>) {
+        let (temp_c, temp_source) = match crate::hwinfo::read_cpu_temp() {
+            Some(t) => (Some(t), Some("HWiNFO")),
+            None => {
+                let acpi_temp = self.acpi.as_ref().and_then(|conn| {
+                    let rows: Vec<AcpiThermalZone> = conn
+                        .raw_query("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
+                        .ok()?;
+                    average(
+                        rows.iter()
+                            .map(|r| r.CurrentTemperature as f32 / 10.0 - 273.15)
+                            .filter(|c| (-50.0..150.0).contains(c)),
+                    )
+                });
+                (acpi_temp, acpi_temp.map(|_| "ACPI zone (approximate)"))
+            }
+        };
 
         let clock_ratio = self.cimv2.as_ref().and_then(|conn| {
             let rows: Vec<ProcessorClock> = conn
@@ -71,7 +82,7 @@ impl CpuThermalMonitor {
             )
         });
 
-        (temp_c, clock_ratio)
+        (temp_c, temp_source, clock_ratio)
     }
 }
 

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rmon": {
+      "type": "stdio",
+      "command": "C:\\Users\\budel\\.cargo\\bin\\rmon.exe",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}

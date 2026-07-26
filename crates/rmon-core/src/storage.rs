@@ -97,6 +97,9 @@ impl Store {
                         cpu_percent: row.get(4)?,
                         gpu_percent: row.get(5)?,
                         gpu_source: GpuSource::from_str(&gpu_source).unwrap(),
+                        user: None,
+                        command_line: None,
+                        handle_count: None,
                     },
                 ))
             },

@@ -113,12 +113,20 @@
                                 Action='set'
                                 System='yes'/>
                         </Component>
-                        <Component Id='binary0' Guid='*'>
+                        <Component Id='GuiBinary' Guid='*'>
                             <File
-                                Id='exe0'
+                                Id='GuiExe'
                                 Name='rmon-gui.exe'
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\rmon-gui.exe'
+                                KeyPath='yes'/>
+                        </Component>
+                        <Component Id='CliBinary' Guid='*'>
+                            <File
+                                Id='CliExe'
+                                Name='rmon.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\rmon.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -157,7 +165,8 @@
             -->
             <ComponentRef Id='License'/>
             
-            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='GuiBinary'/>
+            <ComponentRef Id='CliBinary'/>
             <ComponentRef Id='ApplicationShortcut'/>
 
             <Feature
@@ -180,7 +189,7 @@
           NOTE: `SourceFile`/`Source` paths in this file (here and the
           License.rtf references above/below) are resolved relative to
           candle/light's working directory, which is wherever `cargo wix`
-          itself was invoked from -- the workspace root (`cargo wix -p
+          itself was invoked from — the workspace root (`cargo wix -p
           rmon-gui`), not this crate's directory. Hence the `crates\rmon-gui\`
           prefix instead of the plain relative paths `cargo wix init` scaffolds
           by default.

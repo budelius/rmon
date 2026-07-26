@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -12,8 +13,10 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use rmon_core::{
-    build_tree, list_open_files, GpuSource, OpenFilesScan, ProcessSample, RollingHistory, Sampler,
-    SystemMetrics,
+    build_tree, check_hardware_health, list_all_ports, list_open_files, list_open_files_many,
+    listening_ports_for, AllFilesEntry, GpuSource, HardwareHealthReport, OpenFilesScan, PortEntry,
+    ProcessSample, RollingHistory, Sampler, SystemMetrics, DEFAULT_SCAN_WORKERS,
+    DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS,
 };
 
 const RETAIN: Duration = Duration::from_secs(300);
@@ -84,6 +87,67 @@ type TreeRow = (usize, ProcessSample);
 enum AppView {
     Processes,
     Files,
+    Search,
+    Health,
+}
+
+/// Builds a pid -> name lookup from the currently displayed rows, for
+/// annotating cross-process search results.
+fn build_name_map(rows: &[TreeRow]) -> HashMap<u32, String> {
+    rows.iter().map(|(_, p)| (p.pid, p.name.clone())).collect()
+}
+
+/// Combined, query-filtered list of matching ports and open files across
+/// every process — the rendering (and scroll-bounds) source for the search
+/// view. A free function rather than a method so it doesn't need to borrow
+/// all of `App` just to read `ports`/`search.files`/`rows`.
+fn search_matches(
+    ports: &[PortEntry],
+    files: &[AllFilesEntry],
+    names: &HashMap<u32, String>,
+    query: &str,
+) -> Vec<String> {
+    let q = query.to_lowercase();
+    let mut out = Vec::new();
+    for p in ports {
+        let name = names.get(&p.pid).map(|s| s.as_str()).unwrap_or("?");
+        let haystack = format!(
+            "{} {} {} {}:{}",
+            p.pid,
+            name,
+            p.protocol.as_str(),
+            p.local_addr,
+            p.local_port
+        )
+        .to_lowercase();
+        if !q.is_empty() {
+            if !haystack.contains(&q) {
+                continue;
+            }
+        } else if !p.is_listening() {
+            continue;
+        }
+        out.push(format!(
+            "[PORT] {:<3} {}:{:<6} pid {} ({})  {}",
+            p.protocol.as_str(),
+            p.local_addr,
+            p.local_port,
+            p.pid,
+            name,
+            p.state.map(|s| s.as_str()).unwrap_or("-"),
+        ));
+    }
+    for entry in files {
+        let Ok(scan) = &entry.scan else { continue };
+        let name = names.get(&entry.pid).map(|s| s.as_str()).unwrap_or("?");
+        for path in &scan.paths {
+            if !q.is_empty() && !path.to_lowercase().contains(&q) {
+                continue;
+            }
+            out.push(format!("[FILE] [{} ({})] {path}", entry.pid, name));
+        }
+    }
+    out
 }
 
 enum FilesStatus {
@@ -168,6 +232,152 @@ impl FilesState {
     }
 }
 
+/// Cross-process search: ports are answered instantly from `App::ports`
+/// (already cached every tick); open files need an explicit scan across
+/// every process, kicked off with 'a' the same way `r` rescans a single
+/// process's files.
+struct SearchState {
+    query: String,
+    search_active: bool,
+    files: Vec<AllFilesEntry>,
+    scanned: usize,
+    total: usize,
+    rx: Option<mpsc::Receiver<AllFilesEntry>>,
+    list_state: ListState,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            search_active: false,
+            files: Vec::new(),
+            scanned: 0,
+            total: 0,
+            rx: None,
+            list_state: ListState::default(),
+        }
+    }
+
+    fn start_scan(&mut self, pids: Vec<u32>) {
+        let (tx, rx) = mpsc::channel();
+        self.total = pids.len();
+        self.scanned = 0;
+        self.files.clear();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            list_open_files_many(pids, DEFAULT_SCAN_WORKERS, tx);
+        });
+    }
+
+    fn poll(&mut self) {
+        let Some(rx) = &self.rx else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(entry) => {
+                    self.scanned += 1;
+                    self.files.push(entry);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.rx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn scanning(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    fn select_next(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) if i + 1 < len => i + 1,
+            Some(_) => 0,
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn select_prev(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(0) | None => len - 1,
+            Some(i) => i - 1,
+        };
+        self.list_state.select(Some(i));
+    }
+}
+
+enum HealthStatus {
+    Scanning(mpsc::Receiver<HardwareHealthReport>),
+    Done(HardwareHealthReport),
+}
+
+/// WHEA event log query is slow (`Win32_NTLogEvent` has no useful
+/// server-side filtering beyond Logfile/SourceName) — up to ~30s on a
+/// system that logs frequently — so this always runs on a background
+/// thread, same as `FilesState`.
+struct HealthState {
+    status: HealthStatus,
+    list_state: ListState,
+}
+
+impl HealthState {
+    fn start(days: i64, max_events: usize) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_hardware_health(days, max_events));
+        });
+        Self {
+            status: HealthStatus::Scanning(rx),
+            list_state: ListState::default(),
+        }
+    }
+
+    fn poll(&mut self) {
+        if let HealthStatus::Scanning(rx) = &self.status
+            && let Ok(report) = rx.try_recv()
+        {
+            self.status = HealthStatus::Done(report);
+            self.list_state.select(Some(0));
+        }
+    }
+
+    fn scanning(&self) -> bool {
+        matches!(self.status, HealthStatus::Scanning(_))
+    }
+
+    fn select_next(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) if i + 1 < len => i + 1,
+            Some(_) => 0,
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn select_prev(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(0) | None => len - 1,
+            Some(i) => i - 1,
+        };
+        self.list_state.select(Some(i));
+    }
+}
+
 struct App {
     sampler: Sampler,
     history: RollingHistory,
@@ -182,8 +392,12 @@ struct App {
     selected_pid: Option<u32>,
     has_gpu_source: bool,
     system: SystemMetrics,
+    /// System-wide TCP/UDP endpoint table, refreshed every tick.
+    ports: Vec<PortEntry>,
     app_view: AppView,
     files: Option<FilesState>,
+    search_all: SearchState,
+    health: Option<HealthState>,
 }
 
 impl App {
@@ -208,14 +422,18 @@ impl App {
             selected_pid: None,
             has_gpu_source,
             system: SystemMetrics::default(),
+            ports: Vec::new(),
             app_view: AppView::Processes,
             files: None,
+            search_all: SearchState::new(),
+            health: None,
         }
     }
 
     fn tick(&mut self) {
         let snapshot = self.sampler.sample();
         self.system = snapshot.system.clone();
+        self.ports = list_all_ports().unwrap_or_default();
         self.history.push(snapshot);
         self.resort();
     }
@@ -354,6 +572,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if let Some(fs) = app.files.as_mut() {
             fs.poll();
         }
+        app.search_all.poll();
+        if let Some(h) = app.health.as_mut() {
+            h.poll();
+        }
 
         if last_tick.elapsed() >= TICK {
             app.tick();
@@ -369,6 +591,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
     match app.app_view {
         AppView::Processes => handle_key_processes(app, code),
         AppView::Files => handle_key_files(app, code),
+        AppView::Search => handle_key_search(app, code),
+        AppView::Health => handle_key_health(app, code),
     }
 }
 
@@ -440,6 +664,74 @@ fn handle_key_processes(app: &mut App, code: KeyCode) -> bool {
                 app.app_view = AppView::Files;
             }
         }
+        KeyCode::Char('S') => app.app_view = AppView::Search,
+        KeyCode::Char('H') => {
+            app.app_view = AppView::Health;
+            if app.health.is_none() {
+                app.health = Some(HealthState::start(DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS));
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_key_health(app: &mut App, code: KeyCode) -> bool {
+    let len = app
+        .health
+        .as_ref()
+        .map(|h| match &h.status {
+            HealthStatus::Done(report) => report.whea_events.len(),
+            HealthStatus::Scanning(_) => 0,
+        })
+        .unwrap_or(0);
+    match code {
+        KeyCode::Char('q') => return false,
+        KeyCode::Esc => app.app_view = AppView::Processes,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(h) = app.health.as_mut() {
+                h.select_next(len);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(h) = app.health.as_mut() {
+                h.select_prev(len);
+            }
+        }
+        KeyCode::Char('r') => {
+            if !app.health.as_ref().is_some_and(HealthState::scanning) {
+                app.health = Some(HealthState::start(DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS));
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_key_search(app: &mut App, code: KeyCode) -> bool {
+    if app.search_all.search_active {
+        match code {
+            KeyCode::Enter | KeyCode::Esc => app.search_all.search_active = false,
+            KeyCode::Backspace => {
+                app.search_all.query.pop();
+            }
+            KeyCode::Char(c) => app.search_all.query.push(c),
+            _ => {}
+        }
+        return true;
+    }
+    let names = build_name_map(&app.rows);
+    let len = search_matches(&app.ports, &app.search_all.files, &names, &app.search_all.query).len();
+    match code {
+        KeyCode::Char('q') => return false,
+        KeyCode::Esc => app.app_view = AppView::Processes,
+        KeyCode::Down | KeyCode::Char('j') => app.search_all.select_next(len),
+        KeyCode::Up | KeyCode::Char('k') => app.search_all.select_prev(len),
+        KeyCode::Char('/') => app.search_all.search_active = true,
+        KeyCode::Char('a') => {
+            let pids: Vec<u32> = app.rows.iter().map(|(_, p)| p.pid).collect();
+            app.search_all.start_scan(pids);
+        }
         _ => {}
     }
     true
@@ -481,7 +773,172 @@ fn ui(f: &mut Frame, app: &App) {
     match app.app_view {
         AppView::Processes => ui_processes(f, app),
         AppView::Files => ui_files(f, app),
+        AppView::Search => ui_search(f, app),
+        AppView::Health => ui_health(f, app),
     }
+}
+
+fn ui_health(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let title = Line::from(Span::styled(
+        "Hardware health",
+        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+    ));
+
+    let Some(health) = &app.health else {
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(vec![title, Line::from("press 'r' to check")]),
+            chunks[0],
+        );
+        return;
+    };
+    let HealthStatus::Done(report) = &health.status else {
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(vec![
+                title,
+                Line::from(Span::styled(
+                    "querying the System event log for WHEA entries via WMI — slow, \
+                     unindexed query, can take up to ~30s (more on a system that logs \
+                     frequently)",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ]),
+            chunks[0],
+        );
+        return;
+    };
+
+    let bios_line = Line::from(format!(
+        "BIOS: {} {} (released {})   CPU microcode: {}",
+        report.bios_manufacturer.as_deref().unwrap_or("unknown"),
+        report.bios_version.as_deref().unwrap_or("unknown"),
+        report.bios_release_date.as_deref().unwrap_or("unknown"),
+        report.microcode_revision.as_deref().unwrap_or("unknown"),
+    ));
+    let note_line = Line::from(Span::styled(
+        "cross-reference the above against your CPU/motherboard vendor's own advisories",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let summary_line = match &report.whea_query_error {
+        Some(e) => Line::from(Span::styled(
+            format!("WHEA event query failed: {e}"),
+            Style::default().fg(Color::Red),
+        )),
+        None => Line::from(format!(
+            "{} WHEA event(s) shown, {} error(s), {} warning(s) — an Error-level entry is real \
+             evidence but doesn't confirm degradation by itself",
+            report.whea_events.len(),
+            report.whea_error_count,
+            report.whea_warning_count,
+        )),
+    };
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(vec![title, bios_line, note_line, summary_line]),
+        chunks[0],
+    );
+
+    let items: Vec<ListItem> = report
+        .whea_events
+        .iter()
+        .map(|e| {
+            let color = match e.level.as_str() {
+                "Error" => Color::Red,
+                "Warning" => Color::Yellow,
+                _ => Color::Reset,
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(e.time.format("%Y-%m-%d %H:%M:%S ").to_string()),
+                Span::styled(format!("[{:<11}] ", e.level), Style::default().fg(color)),
+                Span::raw(format!("id={} rec={} ", e.event_id, e.record_number)),
+                Span::raw(&e.message),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!("WHEA events ({})", report.whea_events.len())))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+    let mut state = health.list_state;
+    f.render_stateful_widget(list, chunks[1], &mut state);
+
+    let footer = Line::from("↑/↓ j/k: scroll   r: rescan   Esc: back to processes   q: quit")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(ratatui::widgets::Paragraph::new(footer), chunks[2]);
+}
+
+fn ui_search(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let title = Line::from(Span::styled(
+        "Search all processes",
+        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+    ));
+    let status = if app.search_all.scanning() {
+        Line::from(Span::styled(
+            format!(
+                "scanning open files... {}/{} processes",
+                app.search_all.scanned, app.search_all.total
+            ),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else if app.search_all.total > 0 {
+        Line::from(format!("{} processes scanned for open files", app.search_all.total))
+    } else {
+        Line::from(Span::styled(
+            "press 'a' to scan open files across all processes (ports are already live)",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let query_line = if app.search_all.search_active {
+        Line::from(vec![
+            Span::styled("query: ", Style::default().fg(Color::Yellow)),
+            Span::raw(&app.search_all.query),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ])
+    } else if !app.search_all.query.is_empty() {
+        Line::from(format!("query: {}  (press / to edit)", app.search_all.query))
+    } else {
+        Line::from(Span::styled(
+            "press / to search by pid, process name, address, port, or file path",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(vec![title, status, query_line]),
+        chunks[0],
+    );
+
+    let names = build_name_map(&app.rows);
+    let matches = search_matches(&app.ports, &app.search_all.files, &names, &app.search_all.query);
+    let count = matches.len();
+    let items: Vec<ListItem> = matches.into_iter().map(ListItem::new).collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!("Matches ({count})")))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+    let mut state = app.search_all.list_state;
+    f.render_stateful_widget(list, chunks[1], &mut state);
+
+    let footer = Line::from(
+        "↑/↓ j/k: scroll   /: query   a: scan open files (all processes)   Esc: back to processes   q: quit",
+    )
+    .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(ratatui::widgets::Paragraph::new(footer), chunks[2]);
 }
 
 fn ui_processes(f: &mut Frame, app: &App) {
@@ -672,7 +1129,7 @@ fn thermal_line(app: &App) -> Line<'static> {
 
 fn draw_footer(f: &mut Frame, area: Rect) {
     let line = Line::from(
-        "↑/↓ j/k: select   c/g/t: sort   a: instant/accum   s: subtree/own (tree)   p: tree/flat   f: open files   /: search   q/Esc: quit",
+        "↑/↓ j/k: select   c/g/t: sort   a: instant/accum   s: subtree/own (tree)   p: tree/flat   f: open files   S: search all   H: hardware health   /: search   q/Esc: quit",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(ratatui::widgets::Paragraph::new(line), area);
@@ -736,6 +1193,14 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(7)])
+        .split(area);
+    draw_ports_panel(f, app, pid, chunks[1]);
+    let area = chunks[0];
+
     let name = app
         .rows
         .iter()
@@ -816,4 +1281,18 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         );
 
     f.render_widget(chart, area);
+}
+
+fn draw_ports_panel(f: &mut Frame, app: &App, pid: u32, area: Rect) {
+    let ports = listening_ports_for(&app.ports, pid);
+    let items: Vec<ListItem> = ports
+        .iter()
+        .map(|p| ListItem::new(format!("{:<3} {}:{}", p.protocol.as_str(), p.local_addr, p.local_port)))
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Listening ports ({})", ports.len())),
+    );
+    f.render_widget(list, area);
 }

@@ -39,6 +39,19 @@ cargo run -p rmon-cli -- snapshot --top 20 --tree   # as a parent/child process 
 # Record continuously to SQLite (and optionally CSV) until Ctrl+C
 cargo run -p rmon-cli -- record --db rmon.sqlite --csv rmon.csv --interval-ms 1000
 
+# TCP/UDP endpoints (system-wide, or for one process)
+cargo run -p rmon-cli -- ports --listening
+cargo run -p rmon-cli -- ports 1234
+
+# Search open files and ports across every process at once
+cargo run -p rmon-cli -- search "chrome"
+
+# Hardware health: WHEA event log entries, BIOS version, CPU microcode revision
+cargo run -p rmon-cli -- health --days 7
+
+# MCP server (stdio) for MCP clients such as Claude Desktop/Code
+cargo run -p rmon-cli -- mcp
+
 # Live terminal dashboard
 cargo run -p rmon-tui
 
@@ -103,14 +116,70 @@ out of that:
   reports how many handles this happened to instead of hanging or silently
   under-reporting.
 
+### Listening ports
+
+Every process detail view (the GUI's right-hand panel, the TUI's history
+panel) shows a "Listening ports" section for the selected process: its TCP
+`LISTEN` and bound UDP endpoints. Unlike open files, this comes from a
+single system-wide `GetExtendedTcpTable`/`GetExtendedUdpTable` call
+(`rmon-core::list_all_ports`) refreshed every tick — no elevation, no
+handle-table walk, no per-process cost — so it's just filtered by pid for
+display (`rmon ports [pid]` in the CLI; add `--listening` to drop
+established/non-listening rows).
+
+### Search across all processes
+
+Click "🔎 search all" (GUI), press `S` (TUI), or run `rmon search <query>`
+(CLI) to search open files and TCP/UDP ports across *every* process at
+once, not just the selected one:
+
+- **Ports** match instantly against the already-cached system-wide port
+  table — pid, process name, protocol, address, or port.
+- **Open files** require an explicit scan (a button/key in the GUI/TUI, or
+  a full scan is where the CLI's `search` starts by default — pass
+  `--ports-only` to skip it): `rmon-core::list_open_files_many` fans the
+  existing single-process `list_open_files` scan out across every process,
+  bounded to `DEFAULT_SCAN_WORKERS` (8) concurrent process scans so a
+  system with hundreds of processes doesn't spawn unbounded threads at
+  once. Same best-effort rules as the single-process Files view apply per
+  process (inaccessible processes are skipped, not fatal).
+
+### Hardware health (WHEA events, BIOS, microcode)
+
+Accurate temperature alone never confirms silicon degradation — that's
+usually inferred from new instability under load, actual hardware-reported
+faults, or whether your BIOS/CPU microcode has a vendor's known fix (e.g.
+Intel's 13th/14th-gen voltage erratum). Open "🩺 Hardware health" from the
+GUI's App menu, press `H` (TUI), or run `rmon health` (CLI) for:
+
+- **WHEA events** — `Microsoft-Windows-WHEA-Logger` entries from the
+  System event log (`rmon-core::check_hardware_health`), with counts by
+  level (Error/Warning/Information) and the most recent entries shown.
+  An `Error`-level entry is real hardware-reported evidence; by itself it
+  still doesn't confirm degradation.
+- **BIOS version/release date** and **CPU microcode revision** (the same
+  registry technique CPU-Z/HWiNFO use, no kernel driver needed) — facts to
+  cross-reference against your motherboard/CPU vendor's own advisories.
+  rMon deliberately doesn't try to know which versions fix which errata,
+  since that guidance changes over time and varies by vendor.
+
+This is genuinely slow — `Win32_NTLogEvent` (the only way to read the event
+log via WMI without a separate `EvtQuery`/`wevtapi.dll` FFI layer) has no
+useful server-side filtering beyond `Logfile`/`SourceName`, so a query can
+take anywhere from under a second to 30+ seconds depending on how often the
+system logs WHEA entries. The GUI/TUI run it on a background thread (same
+on-demand philosophy as the Files scan) so it doesn't freeze the UI; the
+CLI and MCP tool just take as long as they take.
+
 ### TUI keys
 
-`↑`/`↓` or `j`/`k` select a process (or scroll the file list) · `c`/`g`/`t`
-sort metric · `a` toggle instant/accumulated · `s` toggle subtree/own
-ranking (tree view) · `p` toggle flat/tree view · `f` open the selected
-process's files · `/` search (Enter to keep, Esc to clear) · `r` rescan
-(files view) · `Esc` back to the process view (or quit, from the process
-view) · `q` quit.
+`↑`/`↓` or `j`/`k` select a process (or scroll the file/search/health list)
+· `c`/`g`/`t` sort metric · `a` toggle instant/accumulated · `s` toggle
+subtree/own ranking (tree view) · `p` toggle flat/tree view · `f` open the
+selected process's files · `S` search open files and ports across every
+process · `H` hardware health (WHEA events, BIOS, microcode) · `/` search
+(Enter to keep, Esc to clear) · `r` rescan (files/health view) · `Esc` back
+to the process view (or quit, from the process view) · `q` quit.
 
 ### Tray icon and autostart (GUI)
 
@@ -148,6 +217,34 @@ doesn't pop a window up.
     cause (thermal vs. power vs. something else) is **not** confirmed —
     unlike the GPU signal, which NVML reports directly.
 
+## MCP server
+
+`rmon mcp` runs an [MCP](https://modelcontextprotocol.io) server over
+stdio (via the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK),
+so any MCP client — Claude Desktop, Claude Code, etc. — can query a running
+system's process/network/file state directly, without a GUI/TUI open. Add
+it to a client's MCP server config the normal way, pointing at
+`rmon mcp` (or the built `rmon.exe mcp`). It exposes seven read-only tools:
+
+- `snapshot` — process list ranked by combined CPU%+GPU%, plus system-wide totals.
+- `process_tree` — the same, as a parent/child tree (optionally ranked by subtree totals).
+- `process_detail` — one pid's basic info, open handle count, open files, and listening ports.
+- `list_ports` — TCP/UDP endpoints system-wide or for one pid, with optional listening-only/substring filtering.
+- `search_open_files` — substring search over open file paths across every process.
+- `system_metrics` — CPU/GPU thermal and throttle telemetry.
+- `hardware_health` — WHEA event log entries, BIOS version, CPU microcode revision (see
+  "Hardware health" above; this one can legitimately take up to ~30 seconds).
+
+CPU%/GPU% are deltas since the previous sample, same as everywhere else in
+rMon, so consecutive `snapshot`/`process_tree` calls (from any client) are
+what make them meaningful — the very first call after the server starts
+warms up internally rather than reporting all zeros. The sampler (which
+holds a WMI connection for CPU thermal data) runs on one dedicated
+background thread for the server's lifetime, since WMI's COM connection is
+tied to the thread that created it; every tool call reaches it through a
+request/response channel instead of touching it from whichever async
+worker thread happens to handle that call.
+
 ## Data model
 
 Every sample is one row per process: `(timestamp, pid, ppid, name,
@@ -158,7 +255,13 @@ bucketed accumulator good for up to 24h) indexed by pid so both are O(1)
 per-process lookups. `rmon-core::build_tree` turns a flat process list into
 a depth-first parent/child ordering for the tree view, optionally ranked by
 subtree-total usage instead of each process's own. `rmon-core::list_open_files`
-does the on-demand kernel-handle-table walk behind the Files view.
+does the on-demand kernel-handle-table walk behind the Files view (fanned
+out across every process by `list_open_files_many`, behind the cross-process
+search). `rmon-core::list_all_ports` reads the system-wide TCP/UDP table
+(`GetExtendedTcpTable`/`GetExtendedUdpTable`) behind the ports views.
+`rmon-core::check_hardware_health` queries WHEA event log entries (via WMI's
+`Win32_NTLogEvent`), BIOS info (`Win32_BIOS`), and the CPU microcode
+revision (registry) behind the hardware-health views.
 
 ## Diagnostics (crash reporting)
 
@@ -174,13 +277,19 @@ stack.
 ## Building a Windows installer
 
 **Download the latest build:** every push to `master` runs the `installer`
-CI job on a GitLab.com Windows SaaS runner and publishes the resulting
-`.msi` as a job artifact, so the latest one is always at:
+CI job on a GitLab.com Windows SaaS runner and publishes both the standalone
+`rmon.exe` CLI and the `.msi` as job artifacts. The MSI installs the GUI and
+CLI (including the ports, search, and MCP commands) and adds their directory
+to `PATH`. Download the latest artifact bundle at:
 <https://gitlab.com/martin-wieser/rmon/-/jobs/artifacts/master/download?job=installer>
-(no login needed -- the project is public). See `.gitlab-ci.yml`: the
-`build` job compiles, tests, and clippy-checks the whole workspace (on
-merge requests and `master`); `installer` additionally installs the WiX
-Toolset via Chocolatey and runs `cargo wix` (`master` only).
+(no login needed -- the project is public). The standalone CLI is also
+available directly at:
+<https://gitlab.com/martin-wieser/rmon/-/jobs/artifacts/master/raw/target/release/rmon.exe?job=installer>
+
+See `.gitlab-ci.yml`: the `build` job compiles, tests, and clippy-checks the
+whole workspace (on merge requests and `master`); `installer` additionally
+builds the release CLI, installs the WiX Toolset via Chocolatey, and runs
+`cargo wix` (`master` only).
 
 To build one locally instead:
 

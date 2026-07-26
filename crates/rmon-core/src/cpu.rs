@@ -1,13 +1,24 @@
 use std::collections::HashMap;
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 /// One process's CPU-side info from a single sampling tick.
 pub struct ProcCpuInfo {
     pub name: String,
     pub cpu_percent: f32,
     pub ppid: Option<u32>,
+    pub user: Option<String>,
+    pub command_line: Option<String>,
 }
+
+const REFRESH_KIND: fn() -> ProcessRefreshKind = || {
+    ProcessRefreshKind::nothing()
+        .with_cpu()
+        .with_memory()
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_user(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+};
 
 /// Wraps `sysinfo` to report per-process CPU usage.
 ///
@@ -17,43 +28,54 @@ pub struct ProcCpuInfo {
 /// get meaningful numbers from the second call onward.
 pub struct CpuMonitor {
     sys: System,
+    users: Users,
 }
 
 impl CpuMonitor {
     pub fn new() -> Self {
         let mut sys = System::new();
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_exe(UpdateKind::OnlyIfNotSet),
-        );
-        Self { sys }
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, REFRESH_KIND());
+        Self {
+            sys,
+            users: Users::new_with_refreshed_list(),
+        }
     }
 
     /// Returns pid -> per-process CPU info.
     pub fn sample(&mut self) -> HashMap<u32, ProcCpuInfo> {
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_exe(UpdateKind::OnlyIfNotSet),
-        );
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, REFRESH_KIND());
         self.sys.refresh_cpu_usage();
+        self.users.refresh();
 
         self.sys
             .processes()
             .iter()
             .map(|(pid, proc_)| {
                 let name = proc_.name().to_string_lossy().to_string();
+                let user = proc_
+                    .user_id()
+                    .and_then(|uid| self.users.get_user_by_id(uid))
+                    .map(|u| u.name().to_string());
+                let command_line = {
+                    let cmd = proc_.cmd();
+                    if cmd.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            cmd.iter()
+                                .map(|s| s.to_string_lossy())
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    }
+                };
                 let info = ProcCpuInfo {
                     name,
                     cpu_percent: proc_.cpu_usage(),
                     ppid: proc_.parent().map(|p| p.as_u32()),
+                    user,
+                    command_line,
                 };
                 (pid.as_u32(), info)
             })

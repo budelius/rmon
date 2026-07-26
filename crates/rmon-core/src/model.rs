@@ -46,6 +46,15 @@ pub struct ProcessSample {
     pub cpu_percent: f32,
     pub gpu_percent: f32,
     pub gpu_source: GpuSource,
+    /// Owning account name (e.g. "DOMAIN\\user"), when resolvable.
+    pub user: Option<String>,
+    /// Full command line, when readable (own processes always; others
+    /// require running elevated).
+    pub command_line: Option<String>,
+    /// Total open handle count (all types, not just files) — cheap via
+    /// `GetProcessHandleCount`, unlike the full file-handle scan in
+    /// `handles.rs`.
+    pub handle_count: Option<u32>,
 }
 
 /// Per-GPU temperature and throttle telemetry (NVIDIA only, via NVML).
@@ -70,6 +79,10 @@ pub struct SystemMetrics {
     /// systems don't expose an accurate (or any) reading here without
     /// vendor tools, so this is frequently `None`.
     pub cpu_temp_c: Option<f32>,
+    /// Where `cpu_temp_c` came from, e.g. `"HWiNFO"` or `"ACPI zone
+    /// (approximate)"` — surfaced so the UI can show its trustworthiness
+    /// rather than implying a precision the reading doesn't have.
+    pub cpu_temp_source: Option<String>,
     /// Current clock speed / max clock speed, averaged across logical
     /// processors reported by `Win32_Processor` (0.0..=1.0).
     pub cpu_clock_ratio: Option<f32>,
