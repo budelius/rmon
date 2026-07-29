@@ -37,13 +37,29 @@ impl Store {
                 name TEXT NOT NULL,
                 cpu_percent REAL NOT NULL,
                 gpu_percent REAL NOT NULL,
-                gpu_source TEXT NOT NULL
+                gpu_source TEXT NOT NULL,
+                handle_count INTEGER,
+                mem_bytes INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
             CREATE INDEX IF NOT EXISTS idx_samples_pid ON samples(pid);
             CREATE INDEX IF NOT EXISTS idx_samples_name ON samples(name);
             "#,
         )?;
+        // Databases created before handle/memory tracking lack the two
+        // nullable columns; ALTER fails with "duplicate column name" once
+        // they exist, which is the signal to do nothing.
+        for ddl in [
+            "ALTER TABLE samples ADD COLUMN handle_count INTEGER",
+            "ALTER TABLE samples ADD COLUMN mem_bytes INTEGER",
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -53,8 +69,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO samples (ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO samples (ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source, handle_count, mem_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             let ts = snapshot.timestamp.timestamp_millis();
             for p in &snapshot.processes {
@@ -66,6 +82,8 @@ impl Store {
                     p.cpu_percent,
                     p.gpu_percent,
                     p.gpu_source.as_str(),
+                    p.handle_count,
+                    p.mem_bytes,
                 ])?;
             }
         }
@@ -80,7 +98,7 @@ impl Store {
         until: DateTime<Utc>,
     ) -> Result<Vec<Snapshot>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source
+            "SELECT ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source, handle_count, mem_bytes
              FROM samples WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts ASC",
         )?;
         let rows = stmt.query_map(
@@ -99,7 +117,8 @@ impl Store {
                         gpu_source: GpuSource::from_str(&gpu_source).unwrap(),
                         user: None,
                         command_line: None,
-                        handle_count: None,
+                        handle_count: row.get(7)?,
+                        mem_bytes: row.get(8)?,
                     },
                 ))
             },
@@ -164,5 +183,90 @@ impl Store {
                 rusqlite::params![before.timestamp_millis()],
             )?;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeDelta;
+
+    fn sample_snapshot(ts: DateTime<Utc>) -> Snapshot {
+        Snapshot {
+            timestamp: ts,
+            processes: vec![ProcessSample {
+                pid: 42,
+                ppid: Some(4),
+                name: "a.exe".to_string(),
+                cpu_percent: 12.5,
+                gpu_percent: 0.0,
+                gpu_source: GpuSource::Unavailable,
+                user: None,
+                command_line: None,
+                handle_count: Some(1234),
+                mem_bytes: Some(64 * 1024 * 1024),
+            }],
+            system: SystemMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn handle_count_and_mem_bytes_roundtrip() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ts = Utc::now();
+        store.insert_snapshot(&sample_snapshot(ts)).unwrap();
+
+        let snaps = store
+            .query_range(ts - TimeDelta::seconds(1), ts + TimeDelta::seconds(1))
+            .unwrap();
+        assert_eq!(snaps.len(), 1);
+        let p = &snaps[0].processes[0];
+        assert_eq!(p.handle_count, Some(1234));
+        assert_eq!(p.mem_bytes, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn opening_a_pre_handle_tracking_db_migrates_it() {
+        let path = std::env::temp_dir().join(format!(
+            "rmon-migration-test-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // Seed a database with the original schema (no handle/memory columns).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    pid INTEGER NOT NULL,
+                    ppid INTEGER,
+                    name TEXT NOT NULL,
+                    cpu_percent REAL NOT NULL,
+                    gpu_percent REAL NOT NULL,
+                    gpu_source TEXT NOT NULL
+                );
+                INSERT INTO samples (ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source)
+                VALUES (1000, 1, NULL, 'old.exe', 1.0, 0.0, 'unavailable');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        // Old rows read back with the new fields as None...
+        let t0 = DateTime::from_timestamp_millis(0).unwrap();
+        let t1 = DateTime::from_timestamp_millis(2000).unwrap();
+        let old = store.query_range(t0, t1).unwrap();
+        assert_eq!(old[0].processes[0].handle_count, None);
+        // ...and new-format rows insert fine into the migrated table.
+        store.insert_snapshot(&sample_snapshot(Utc::now())).unwrap();
+        // Reopening must also be a no-op (migration is idempotent).
+        drop(store);
+        Store::open(&path).unwrap();
+
+        let _ = std::fs::remove_file(&path);
     }
 }

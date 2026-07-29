@@ -92,10 +92,10 @@ pub struct OpenFilesScan {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UnicodeString {
-    length: u16,
-    maximum_length: u16,
-    buffer: *mut u16,
+pub(crate) struct UnicodeString {
+    pub(crate) length: u16,
+    pub(crate) maximum_length: u16,
+    pub(crate) buffer: *mut u16,
 }
 
 #[repr(C)]
@@ -372,9 +372,10 @@ unsafe fn duplicate_and_query_name_with_timeout(process: HANDLE, handle_value: H
 }
 
 /// Reads a `UNICODE_STRING` at `offset` in `buf`, where `buffer` points
-/// somewhere *inside `buf` itself* (NtQueryObject lays the string data out
-/// contiguously after the struct in the same output buffer).
-unsafe fn read_unicode_string_at(buf: &[u8], offset: usize) -> Option<String> {
+/// somewhere *inside `buf` itself* (NtQueryObject — and several other NT
+/// query APIs, see `cpu.rs` — lay the string data out contiguously after
+/// the struct in the same output buffer).
+pub(crate) unsafe fn read_unicode_string_at(buf: &[u8], offset: usize) -> Option<String> {
     if offset + std::mem::size_of::<UnicodeString>() > buf.len() {
         return None;
     }

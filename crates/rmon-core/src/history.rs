@@ -26,6 +26,11 @@ struct AccumBucket {
     /// approximate "core-seconds" figure.
     cpu_pct_sec: f64,
     gpu_pct_sec: f64,
+    /// Last-seen open handle count / working-set bytes in this bucket.
+    /// Point-in-time values (not integrated like CPU): a 60s-spaced series
+    /// of these is what leak-trend detection consumes.
+    handles: Option<u32>,
+    mem_bytes: Option<u64>,
 }
 
 /// An in-memory rolling window of recent samples, used by the live UIs
@@ -41,6 +46,11 @@ pub struct RollingHistory {
     latest: Option<Snapshot>,
     per_pid: HashMap<u32, VecDeque<(DateTime<Utc>, f32, f32)>>,
     accum: HashMap<u32, VecDeque<AccumBucket>>,
+    /// Process name last seen for each tracked pid. Windows reuses pids, so
+    /// when a pid comes back under a different name its accumulated history
+    /// belongs to a dead process — it's dropped rather than letting the old
+    /// series fabricate totals/trends for the new one.
+    names: HashMap<u32, String>,
     last_push_ts: Option<DateTime<Utc>>,
     started_at: DateTime<Utc>,
 }
@@ -52,6 +62,7 @@ impl RollingHistory {
             latest: None,
             per_pid: HashMap::new(),
             accum: HashMap::new(),
+            names: HashMap::new(),
             last_push_ts: None,
             started_at: Utc::now(),
         }
@@ -67,22 +78,38 @@ impl RollingHistory {
         self.last_push_ts = Some(ts);
 
         for p in &snapshot.processes {
+            match self.names.get(&p.pid) {
+                Some(name) if *name == p.name => {}
+                Some(_) => {
+                    // pid reused by a different process — old history is
+                    // the dead process's, not this one's.
+                    self.per_pid.remove(&p.pid);
+                    self.accum.remove(&p.pid);
+                    self.names.insert(p.pid, p.name.clone());
+                }
+                None => {
+                    self.names.insert(p.pid, p.name.clone());
+                }
+            }
             self.per_pid
                 .entry(p.pid)
                 .or_default()
                 .push_back((ts, p.cpu_percent, p.gpu_percent));
-            if dt > 0.0 {
-                accumulate(
-                    self.accum.entry(p.pid).or_default(),
-                    ts,
-                    p.cpu_percent as f64 * dt,
-                    p.gpu_percent as f64 * dt,
-                );
-            }
+            accumulate(
+                self.accum.entry(p.pid).or_default(),
+                ts,
+                p.cpu_percent as f64 * dt,
+                p.gpu_percent as f64 * dt,
+                p.handle_count,
+                p.mem_bytes,
+            );
         }
         self.latest = Some(snapshot);
         self.evict_old();
         self.evict_old_accum();
+        let (per_pid, accum) = (&self.per_pid, &self.accum);
+        self.names
+            .retain(|pid, _| per_pid.contains_key(pid) || accum.contains_key(pid));
     }
 
     fn evict_old(&mut self) {
@@ -151,6 +178,30 @@ impl RollingHistory {
             .fold((0.0, 0.0), |(c, g), b| (c + b.cpu_pct_sec, g + b.gpu_pct_sec))
     }
 
+    /// Open-handle-count series for a pid over the long accumulation window
+    /// (one point per `ACCUM_BUCKET`, up to `ACCUM_RETAIN` back), oldest
+    /// first. This — not the short raw window — is what trend/leak
+    /// detection should consume.
+    pub fn handle_series(&self, pid: u32) -> Vec<(DateTime<Utc>, f64)> {
+        self.bucket_series(pid, |b| b.handles.map(|h| h as f64))
+    }
+
+    /// Working-set-bytes series for a pid, same shape as `handle_series`.
+    pub fn mem_series(&self, pid: u32) -> Vec<(DateTime<Utc>, f64)> {
+        self.bucket_series(pid, |b| b.mem_bytes.map(|m| m as f64))
+    }
+
+    fn bucket_series(
+        &self,
+        pid: u32,
+        value: impl Fn(&AccumBucket) -> Option<f64>,
+    ) -> Vec<(DateTime<Utc>, f64)> {
+        let Some(dq) = self.accum.get(&pid) else {
+            return Vec::new();
+        };
+        dq.iter().filter_map(|b| value(b).map(|v| (b.start, v))).collect()
+    }
+
     /// How much of the (up to `ACCUM_RETAIN`) accumulation window is
     /// actually covered so far — i.e. how long this `RollingHistory` has
     /// been running. Accumulated totals are only as meaningful as this is
@@ -166,17 +217,28 @@ impl RollingHistory {
     }
 }
 
-fn accumulate(dq: &mut VecDeque<AccumBucket>, ts: DateTime<Utc>, cpu_pct_sec: f64, gpu_pct_sec: f64) {
+fn accumulate(
+    dq: &mut VecDeque<AccumBucket>,
+    ts: DateTime<Utc>,
+    cpu_pct_sec: f64,
+    gpu_pct_sec: f64,
+    handles: Option<u32>,
+    mem_bytes: Option<u64>,
+) {
     let bucket_start = floor_to_bucket(ts, ACCUM_BUCKET);
     match dq.back_mut() {
         Some(b) if b.start == bucket_start => {
             b.cpu_pct_sec += cpu_pct_sec;
             b.gpu_pct_sec += gpu_pct_sec;
+            b.handles = handles.or(b.handles);
+            b.mem_bytes = mem_bytes.or(b.mem_bytes);
         }
         _ => dq.push_back(AccumBucket {
             start: bucket_start,
             cpu_pct_sec,
             gpu_pct_sec,
+            handles,
+            mem_bytes,
         }),
     }
 }
@@ -186,4 +248,60 @@ fn floor_to_bucket(ts: DateTime<Utc>, span: Duration) -> DateTime<Utc> {
     let secs = ts.timestamp();
     let floored = secs - secs.rem_euclid(span_secs);
     DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{GpuSource, ProcessSample, SystemMetrics};
+
+    fn snapshot(ts: DateTime<Utc>, pid: u32, name: &str, handles: u32, cpu: f32) -> Snapshot {
+        Snapshot {
+            timestamp: ts,
+            processes: vec![ProcessSample {
+                pid,
+                ppid: None,
+                name: name.to_string(),
+                cpu_percent: cpu,
+                gpu_percent: 0.0,
+                gpu_source: GpuSource::Unavailable,
+                user: None,
+                command_line: None,
+                handle_count: Some(handles),
+                mem_bytes: Some(1024),
+            }],
+            system: SystemMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn handle_series_tracks_bucketed_values() {
+        let mut h = RollingHistory::new(Duration::from_secs(300));
+        let t0 = Utc::now() - chrono::Duration::seconds(180);
+        for i in 0..3 {
+            h.push(snapshot(t0 + chrono::Duration::seconds(60 * i), 1, "a.exe", 100 + i as u32, 50.0));
+        }
+        let series = h.handle_series(1);
+        assert_eq!(series.len(), 3);
+        assert_eq!(series.last().unwrap().1, 102.0);
+    }
+
+    #[test]
+    fn pid_reuse_under_different_name_resets_history() {
+        let mut h = RollingHistory::new(Duration::from_secs(300));
+        let t0 = Utc::now() - chrono::Duration::seconds(180);
+        h.push(snapshot(t0, 1, "a.exe", 5000, 50.0));
+        h.push(snapshot(t0 + chrono::Duration::seconds(60), 1, "a.exe", 6000, 50.0));
+        let (cpu_before, _) = h.accumulated(1);
+        assert!(cpu_before > 0.0);
+
+        // Same pid comes back as a different (idle) executable — the old
+        // process's accumulated CPU must not be attributed to it.
+        h.push(snapshot(t0 + chrono::Duration::seconds(120), 1, "b.exe", 10, 0.0));
+        let (cpu_after, _) = h.accumulated(1);
+        assert_eq!(cpu_after, 0.0);
+        let series = h.handle_series(1);
+        assert_eq!(series.len(), 1, "old process's series must be dropped");
+        assert_eq!(series[0].1, 10.0);
+    }
 }

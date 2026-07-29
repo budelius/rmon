@@ -16,6 +16,7 @@ mod sampler;
 mod storage;
 mod thermal;
 mod tree;
+pub mod trends;
 
 pub use handles::{
     handle_count, kill_process, list_open_files, list_open_files_many, AllFilesEntry,

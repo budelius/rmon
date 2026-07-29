@@ -55,6 +55,8 @@ pub struct ProcessSample {
     /// `GetProcessHandleCount`, unlike the full file-handle scan in
     /// `handles.rs`.
     pub handle_count: Option<u32>,
+    /// Working-set (resident) memory in bytes, when available.
+    pub mem_bytes: Option<u64>,
 }
 
 /// Per-GPU temperature and throttle telemetry (NVIDIA only, via NVML).

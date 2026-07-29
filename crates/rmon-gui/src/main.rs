@@ -85,6 +85,17 @@ fn format_core_time(pct_seconds: f64) -> String {
     format_duration(Duration::from_secs_f64((pct_seconds / 100.0).max(0.0)))
 }
 
+fn format_bytes(b: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = b as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else {
+        format!("{:.0} MiB", b / MIB)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Flat,
@@ -276,6 +287,10 @@ struct RmonApp {
     exited_open: bool,
     hardware_open: bool,
     health_open: bool,
+    suspects_open: bool,
+    /// Per-process trend analysis (leak suspects, idle burners), recomputed
+    /// once per tick — never per frame; sorted most-interesting first.
+    trends: Vec<rmon_core::trends::ProcessTrend>,
     /// WHEA events / BIOS / microcode revision — `None` until the view is
     /// opened for the first time (or "rescan" is clicked again).
     health: Option<HealthState>,
@@ -339,6 +354,8 @@ impl RmonApp {
             exited_open: false,
             hardware_open: false,
             health_open: false,
+            suspects_open: false,
+            trends: Vec::new(),
             health: None,
             short_lived: match ShortLivedWatcher::start() {
                 Ok(w) => Some(w),
@@ -388,7 +405,16 @@ impl RmonApp {
         }
 
         self.history.push(snapshot);
+        self.trends = rmon_core::trends::analyze(&self.history);
         self.resort();
+    }
+
+    fn trend_for(&self, pid: u32) -> Option<&rmon_core::trends::ProcessTrend> {
+        self.trends.iter().find(|t| t.pid == pid)
+    }
+
+    fn suspect_count(&self) -> usize {
+        self.trends.iter().filter(|t| t.flagged()).count()
     }
 
     fn resort(&mut self) {
@@ -557,6 +583,7 @@ impl RmonApp {
         self.exited_open = false;
         self.hardware_open = false;
         self.health_open = false;
+        self.suspects_open = false;
         self.files = None;
     }
 
@@ -565,14 +592,15 @@ impl RmonApp {
     fn copy_info_text(&self, pid: u32) -> Option<String> {
         let p = self.rows.iter().find(|(_, p)| p.pid == pid).map(|(_, p)| p)?;
         let (cpu_accum, gpu_accum) = self.history.accumulated(pid);
-        Some(format!(
+        let mut text = format!(
             "Process: {} (PID {})\n\
              Parent PID: {}{}\n\
              Owner: {}\n\
              Command line: {}\n\
              CPU: {:.1}% instant, {} accumulated (over {})\n\
              GPU: {:.1}% instant, {} accumulated  [source: {}]\n\
-             Open handles: {}\n",
+             Open handles: {}\n\
+             Memory: {}\n",
             p.name,
             p.pid,
             p.ppid.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
@@ -589,10 +617,15 @@ impl RmonApp {
             p.gpu_percent,
             format_core_time(gpu_accum),
             gpu_source_label(p.gpu_source),
-            rmon_core::handle_count(pid)
+            p.handle_count
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-        ))
+            p.mem_bytes.map(format_bytes).unwrap_or_else(|| "unknown".to_string()),
+        );
+        if let Some(verdict) = self.trend_for(pid).and_then(|t| t.verdict.as_deref()) {
+            text.push_str(&format!("Trend: {verdict}\n"));
+        }
+        Some(text)
     }
 }
 
@@ -698,6 +731,11 @@ impl eframe::App for RmonApp {
                             self.health =
                                 Some(HealthState::start(DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS));
                         }
+                        ui.close();
+                    }
+                    if ui.button("⚠ Leak && idle suspects").clicked() {
+                        self.close_side_panels();
+                        self.suspects_open = true;
                         ui.close();
                     }
                     ui.separator();
@@ -806,6 +844,20 @@ impl eframe::App for RmonApp {
                     "accumulation window: {} of up to 24h",
                     format_duration(self.history.accum_window())
                 ));
+                let suspect_count = self.suspect_count();
+                if suspect_count > 0 {
+                    ui.separator();
+                    let label = egui::RichText::new(format!("⚠ {suspect_count} suspect(s)"))
+                        .color(egui::Color32::from_rgb(220, 120, 0));
+                    if ui
+                        .add(egui::Label::new(label).sense(egui::Sense::click()))
+                        .on_hover_text("processes with a possible handle/memory leak or sustained background CPU — click for details")
+                        .clicked()
+                    {
+                        self.close_side_panels();
+                        self.suspects_open = true;
+                    }
+                }
                 if self.recording {
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "● recording");
@@ -814,24 +866,44 @@ impl eframe::App for RmonApp {
             ui.add_space(4.0);
         });
 
-        egui::Panel::right("detail").default_size(640.0).show(ui, |ui| {
-            self.draw_detail(ui);
-        });
+        // Three equal, independently draggable columns: process list, process
+        // detail, and its CPU/GPU history graph. Each `Panel::left` remembers
+        // its own width (keyed by id) via egui's persisted memory, so the
+        // layout survives restarts once eframe's "persistence" feature is on.
+        let column_width = ui.available_width() / 3.0;
+
+        egui::Panel::left("column_processes")
+            .resizable(true)
+            .default_size(column_width)
+            .min_size(200.0)
+            .show(ui, |ui| {
+                if self.settings_open {
+                    self.draw_settings(ui);
+                } else if self.search_open {
+                    self.draw_search_all(ui);
+                } else if self.exited_open {
+                    self.draw_recent_exits(ui);
+                } else if self.hardware_open {
+                    self.draw_hardware(ui);
+                } else if self.health_open {
+                    self.draw_health(ui);
+                } else if self.suspects_open {
+                    self.draw_suspects(ui);
+                } else {
+                    self.draw_table(ui);
+                }
+            });
+
+        egui::Panel::left("column_details")
+            .resizable(true)
+            .default_size(column_width)
+            .min_size(200.0)
+            .show(ui, |ui| {
+                self.draw_detail_info(ui);
+            });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.settings_open {
-                self.draw_settings(ui);
-            } else if self.search_open {
-                self.draw_search_all(ui);
-            } else if self.exited_open {
-                self.draw_recent_exits(ui);
-            } else if self.hardware_open {
-                self.draw_hardware(ui);
-            } else if self.health_open {
-                self.draw_health(ui);
-            } else {
-                self.draw_table(ui);
-            }
+            self.draw_detail_graph(ui);
         });
     }
 }
@@ -1095,7 +1167,12 @@ impl RmonApp {
         }
     }
 
-    fn draw_detail(&mut self, ui: &mut egui::Ui) {
+    fn draw_detail_info(&mut self, ui: &mut egui::Ui) {
+        // Pin the width explicitly: without it, the unwrapped file-path
+        // labels in the "Open files" list (nested `ScrollArea`s default to
+        // growing to fit their content on the cross axis) balloon this
+        // panel's measured size every frame instead of wrapping.
+        ui.set_max_width(ui.available_width());
         let Some(pid) = self.selected_pid else {
             ui.label("Select a process to see its history.");
             return;
@@ -1148,9 +1225,29 @@ impl RmonApp {
             );
             ui.add_space(16.0);
             ui.weak("open handles:");
+            let mut handles_text = proc_info
+                .as_ref()
+                .and_then(|p| p.handle_count)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "—".to_string());
+            if let Some(s) = self.trend_for(pid).and_then(|t| t.handles)
+                && s.span_secs >= 120.0
+                && s.slope_per_hour.abs() >= 1.0
+            {
+                handles_text.push_str(&format!(
+                    "  ({:+.0}/h over {})",
+                    s.slope_per_hour,
+                    format_duration(Duration::from_secs_f64(s.span_secs)),
+                ));
+            }
+            ui.label(handles_text);
+            ui.add_space(16.0);
+            ui.weak("memory:");
             ui.label(
-                rmon_core::handle_count(pid)
-                    .map(|n| n.to_string())
+                proc_info
+                    .as_ref()
+                    .and_then(|p| p.mem_bytes)
+                    .map(format_bytes)
                     .unwrap_or_else(|| "—".to_string()),
             );
         });
@@ -1183,112 +1280,181 @@ impl RmonApp {
             format_duration(self.history.accum_window()),
         );
 
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui(egui::vec2(260.0, ui.available_height()), |ui| {
-                ui.set_max_width(260.0);
-                ui.vertical(|ui| {
-                    if let Some(line) = &now_line {
-                        ui.label(line);
-                    }
-                    ui.label(accum_line);
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.label(egui::RichText::new("Open files").strong());
+        if let Some(line) = &now_line {
+            ui.label(line);
+        }
+        ui.label(accum_line);
+        if let Some(verdict) = self.trend_for(pid).and_then(|t| t.verdict.clone()) {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 120, 0),
+                format!("⚠ {verdict}"),
+            );
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Open files").strong());
 
-                    match self.files.as_mut().filter(|fs| fs.pid == pid) {
-                        Some(fs) => {
-                            match &fs.status {
-                                FilesStatus::Scanning(_) => {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.weak("scanning...");
-                                    });
-                                }
-                                FilesStatus::Done(scan) => {
-                                    ui.weak(format!(
-                                        "{} file(s)   ({} handles, {} timed out)",
-                                        scan.paths.len(),
-                                        scan.handles_seen,
-                                        scan.timed_out
-                                    ));
-                                }
-                                FilesStatus::Error(e) => {
-                                    ui.colored_label(egui::Color32::RED, format!("error: {e}"));
-                                }
+        match self.files.as_mut().filter(|fs| fs.pid == pid) {
+            Some(fs) => {
+                match &fs.status {
+                    FilesStatus::Scanning(_) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak("scanning...");
+                        });
+                    }
+                    FilesStatus::Done(scan) => {
+                        ui.weak(format!(
+                            "{} file(s)   ({} handles, {} timed out)",
+                            scan.paths.len(),
+                            scan.handles_seen,
+                            scan.timed_out
+                        ));
+                    }
+                    FilesStatus::Error(e) => {
+                        ui.colored_label(egui::Color32::RED, format!("error: {e}"));
+                    }
+                }
+                ui.text_edit_singleline(&mut fs.search);
+                let paths = fs.filtered_paths();
+                let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                egui::ScrollArea::vertical()
+                    .id_salt("detail-open-files")
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, paths.len(), |ui, range| {
+                        for i in range {
+                            ui.label(egui::RichText::new(paths[i]).small());
+                        }
+                    });
+            }
+            None => {
+                ui.weak("click \"open files\" above to scan");
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Listening ports").strong());
+        let ports = listening_ports_for(&self.ports, pid);
+        ui.weak(format!("{} listening", ports.len()));
+        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+        egui::ScrollArea::vertical()
+            .id_salt("detail-ports")
+            .max_height(160.0)
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, ports.len(), |ui, range| {
+                for i in range {
+                    let p = &ports[i];
+                    ui.label(
+                        egui::RichText::new(format!("{:<3} {}:{}", p.protocol.as_str(), p.local_addr, p.local_port))
+                            .small()
+                            .monospace(),
+                    );
+                }
+            });
+    }
+
+    fn draw_detail_graph(&mut self, ui: &mut egui::Ui) {
+        let Some(pid) = self.selected_pid else {
+            return;
+        };
+        let series = self.history.series_for_pid(pid);
+        if series.is_empty() {
+            ui.label("No history yet.");
+            return;
+        }
+        let t0 = series[0].0;
+        let cpu_points: Vec<[f64; 2]> = series
+            .iter()
+            .map(|(t, cpu, _)| [(*t - t0).num_milliseconds() as f64 / 1000.0, *cpu as f64])
+            .collect();
+        let gpu_points: Vec<[f64; 2]> = series
+            .iter()
+            .map(|(t, _, gpu)| [(*t - t0).num_milliseconds() as f64 / 1000.0, *gpu as f64])
+            .collect();
+
+        Plot::new(format!("history-{pid}"))
+            .legend(Legend::default())
+            .include_y(0.0)
+            .show(ui, |plot_ui| {
+                plot_ui.line(Line::new("CPU%", PlotPoints::new(cpu_points)));
+                plot_ui.line(Line::new("GPU%", PlotPoints::new(gpu_points)));
+            });
+    }
+
+    /// Full-width panel listing trend-flagged processes: possible handle/
+    /// memory leaks (sustained monotonic growth over ≥30 min) and idle
+    /// burners (large accumulated CPU while currently near-idle). All of it
+    /// is heuristic over this session's in-memory history — a flagged
+    /// process is a suspect worth looking at, not a confirmed leak.
+    fn draw_suspects(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("← back").clicked() {
+                self.suspects_open = false;
+            }
+            ui.heading("Leak & idle suspects");
+        });
+        ui.weak(format!(
+            "based on {} of observed history (resets when rMon restarts)",
+            format_duration(self.history.accum_window())
+        ));
+        ui.add_space(8.0);
+
+        let suspects: Vec<rmon_core::trends::ProcessTrend> = self
+            .trends
+            .iter()
+            .filter(|t| t.flagged())
+            .cloned()
+            .collect();
+        if suspects.is_empty() {
+            ui.label("Nothing flagged right now.");
+            ui.weak(
+                "Leak detection needs ≥30 minutes of sustained, mostly-monotonic growth in a \
+                 process's handle count or working set before it flags anything; idle burners \
+                 need ≥5 core-minutes of accumulated CPU. Leave rMon running and check back.",
+            );
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for t in &suspects {
+                    let selected = self.selected_pid == Some(t.pid);
+                    let resp = ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            let mut kinds = Vec::new();
+                            if t.handle_leak_suspect {
+                                kinds.push("handle leak?");
                             }
-                            ui.text_edit_singleline(&mut fs.search);
-                            let paths = fs.filtered_paths();
-                            let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                            egui::ScrollArea::vertical()
-                                .id_salt("detail-open-files")
-                                .max_height(220.0)
-                                .auto_shrink([false, false])
-                                .show_rows(ui, row_height, paths.len(), |ui, range| {
-                                    for i in range {
-                                        ui.label(egui::RichText::new(paths[i]).small());
-                                    }
-                                });
-                        }
-                        None => {
-                            ui.weak("click \"open files\" above to scan");
-                        }
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.label(egui::RichText::new("Listening ports").strong());
-                    let ports = listening_ports_for(&self.ports, pid);
-                    ui.weak(format!("{} listening", ports.len()));
-                    let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                    egui::ScrollArea::vertical()
-                        .id_salt("detail-ports")
-                        .max_height(160.0)
-                        .auto_shrink([false, false])
-                        .show_rows(ui, row_height, ports.len(), |ui, range| {
-                            for i in range {
-                                let p = &ports[i];
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{:<3} {}:{}",
-                                        p.protocol.as_str(),
-                                        p.local_addr,
-                                        p.local_port
-                                    ))
-                                    .small()
-                                    .monospace(),
-                                );
+                            if t.mem_leak_suspect {
+                                kinds.push("memory leak?");
+                            }
+                            if t.idle_burner {
+                                kinds.push("idle burner");
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{} ({})", t.name, t.pid)).strong(),
+                            );
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 120, 0),
+                                kinds.join(" · "),
+                            );
+                            if selected {
+                                ui.weak("(selected)");
                             }
                         });
-                });
-            });
-
-            ui.separator();
-
-            ui.vertical(|ui| {
-                if series.is_empty() {
-                    ui.label("No history yet.");
-                    return;
-                }
-                let t0 = series[0].0;
-                let cpu_points: Vec<[f64; 2]> = series
-                    .iter()
-                    .map(|(t, cpu, _)| [(*t - t0).num_milliseconds() as f64 / 1000.0, *cpu as f64])
-                    .collect();
-                let gpu_points: Vec<[f64; 2]> = series
-                    .iter()
-                    .map(|(t, _, gpu)| [(*t - t0).num_milliseconds() as f64 / 1000.0, *gpu as f64])
-                    .collect();
-
-                Plot::new(format!("history-{pid}"))
-                    .legend(Legend::default())
-                    .height(320.0)
-                    .include_y(0.0)
-                    .show(ui, |plot_ui| {
-                        plot_ui.line(Line::new("CPU%", PlotPoints::new(cpu_points)));
-                        plot_ui.line(Line::new("GPU%", PlotPoints::new(gpu_points)));
+                        if let Some(v) = &t.verdict {
+                            ui.label(egui::RichText::new(v).small());
+                        }
                     });
+                    if resp.response.interact(egui::Sense::click()).clicked() {
+                        self.selected_pid = Some(t.pid);
+                        self.scroll_to_selected = true;
+                    }
+                }
             });
-        });
     }
 
     /// Substring search for open files and listening ports across *every*

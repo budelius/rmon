@@ -136,6 +136,7 @@ pub fn merge_recent_exits(
                 user: None,
                 command_line: None,
                 handle_count: None,
+                mem_bytes: None,
             });
             if let Some(grandparent) = exit.ppid {
                 next.push(grandparent);
@@ -206,6 +207,7 @@ mod tests {
             user: None,
             command_line: None,
             handle_count: None,
+            mem_bytes: None,
         }
     }
 

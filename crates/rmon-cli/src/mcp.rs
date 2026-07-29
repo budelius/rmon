@@ -1,6 +1,7 @@
 //! MCP (Model Context Protocol) server exposing rMon's full read surface —
 //! process snapshot/tree, per-process detail (open files, listening ports,
-//! handle count), system thermal telemetry, and cross-process file/port
+//! handle count), per-process trend analytics (handle/memory leak suspects,
+//! idle CPU burners), system thermal telemetry, and cross-process file/port
 //! search — over stdio, so any MCP client (Claude Desktop/Code, etc.) can
 //! query a running system the same way the GUI/TUI/CLI do.
 //!
@@ -20,7 +21,8 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
@@ -29,12 +31,23 @@ use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError, ServiceExt};
 use rmon_core::{
     build_tree, check_hardware_health, handle_count, list_all_ports, list_open_files,
-    list_open_files_many, listening_ports_for, merge_recent_exits, PortEntry, ProcessSample,
-    Sampler, ShortLivedWatcher, Snapshot, SystemMetrics, DEFAULT_GHOST_MAX_DEPTH,
-    DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS,
+    list_open_files_many, listening_ports_for, merge_recent_exits, trends, PortEntry,
+    ProcessSample, RollingHistory, Sampler, ShortLivedWatcher, Snapshot, SystemMetrics,
+    DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
+    DEFAULT_WHEA_MAX_EVENTS,
 };
 use serde::Deserialize;
 use serde_json::json;
+
+/// Cadence of the background samples that feed trend history. A tick is a
+/// single NtQuerySystemInformation process walk (a few ms) — 5s keeps the
+/// CPU accumulator honest (its per-tick delta clamp is 10s) while staying
+/// negligible as background load.
+const TREND_TICK: Duration = Duration::from_secs(5);
+/// Raw short-window retention for the shared history; the ~24h bucketed
+/// accumulator that trend detection actually reads lives inside
+/// `RollingHistory` regardless of this.
+const TREND_RETAIN: Duration = Duration::from_secs(300);
 
 /// Builds the server, serves it over stdio, and blocks until the client
 /// disconnects.
@@ -69,6 +82,8 @@ fn process_json(p: &ProcessSample) -> serde_json::Value {
         "gpu_source": p.gpu_source.as_str(),
         "user": p.user,
         "command_line": p.command_line,
+        "handle_count": p.handle_count,
+        "mem_bytes": p.mem_bytes,
     })
 }
 
@@ -154,6 +169,18 @@ struct SearchFilesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TrendsArgs {
+    /// Only return flagged suspects — possible handle/memory leaks and
+    /// idle burners (default: false, return every analyzed process,
+    /// most interesting first).
+    #[serde(default)]
+    suspects_only: bool,
+    /// Cap on how many entries to return.
+    #[serde(default)]
+    top: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct HealthArgs {
     /// How many days back to search the System event log for WHEA entries (default 30).
     #[serde(default)]
@@ -170,6 +197,10 @@ enum SamplerMsg {
 #[derive(Clone)]
 struct RmonMcpServer {
     tx: std_mpsc::Sender<SamplerMsg>,
+    /// Trend history fed by the sampler thread's background ticks (and by
+    /// every on-demand sample). Only covers this server's uptime — leak
+    /// detection needs the server to have been running ≥30 min.
+    history: Arc<Mutex<RollingHistory>>,
     /// `Arc` (not just `Option<ShortLivedWatcher>`) because the tool
     /// router requires `Self: Clone`, and the ETW trace session inside
     /// `ShortLivedWatcher` isn't cloneable itself — only shareable.
@@ -181,14 +212,33 @@ struct RmonMcpServer {
 impl RmonMcpServer {
     fn new() -> Self {
         let (tx, rx) = std_mpsc::channel::<SamplerMsg>();
+        let history = Arc::new(Mutex::new(RollingHistory::new(TREND_RETAIN)));
+        let history_writer = Arc::clone(&history);
         std::thread::spawn(move || {
             let mut sampler = Sampler::new();
             sampler.sample(); // warm up — CPU%/GPU% are deltas since the previous sample
-            for msg in rx {
-                match msg {
-                    SamplerMsg::Sample(reply) => {
-                        let _ = reply.send(sampler.sample());
+            loop {
+                // Instead of blocking on requests forever, wake up every
+                // TREND_TICK to sample into the trend history — that's what
+                // gives `process_trends` hours of data even when no client
+                // has called a tool in the meantime.
+                match rx.recv_timeout(TREND_TICK) {
+                    Ok(SamplerMsg::Sample(reply)) => {
+                        let snap = sampler.sample();
+                        history_writer
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(snap.clone());
+                        let _ = reply.send(snap);
                     }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        let snap = sampler.sample();
+                        history_writer
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(snap);
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
@@ -196,7 +246,7 @@ impl RmonMcpServer {
             Ok(w) => (Some(Arc::new(w)), None),
             Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
         };
-        Self { tx, short_lived, short_lived_error }
+        Self { tx, history, short_lived, short_lived_error }
     }
 
     /// Takes a fresh sample from the dedicated sampler thread. CPU%/GPU% on
@@ -340,12 +390,46 @@ impl RmonMcpServer {
             None
         };
 
+        let trend = {
+            let history = self.history.lock().expect("history mutex poisoned");
+            trends::analyze(&history).into_iter().find(|t| t.pid == args.pid)
+        };
+
         text_result(&json!({
             "pid": args.pid,
             "process": info,
             "handle_count": handles,
+            "trend": trend,
             "open_files": files,
             "listening_ports": ports,
+        }))
+    }
+
+    #[tool(
+        description = "Per-process trend analytics over this server's uptime: handle-count and working-set growth (least-squares slope, monotonicity, leak-suspect flags for sustained monotonic growth over >=30 min) and accumulated CPU/GPU core-seconds with 'idle burner' flags (large accumulated CPU while currently near-idle — the classic quietly-misbehaving background process). History is sampled in the background every few seconds but only exists since this MCP server started: with under ~30 minutes of uptime nothing will be flagged yet, and `observed_window_secs` says how much history the verdicts rest on. Flags are conservative heuristics — treat a flagged process as a suspect worth investigating (e.g. restart it and watch whether the count resets then climbs again), not a confirmed leak."
+    )]
+    async fn process_trends(
+        &self,
+        Parameters(args): Parameters<TrendsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Take a fresh sample first so `latest()` (the process list trends
+        // are computed for) is current rather than up to TREND_TICK stale.
+        let _ = self.snapshot_now().await;
+        let (window_secs, mut all) = {
+            let history = self.history.lock().expect("history mutex poisoned");
+            (history.accum_window().as_secs(), trends::analyze(&history))
+        };
+        if args.suspects_only {
+            all.retain(trends::ProcessTrend::flagged);
+        }
+        let suspect_count = all.iter().filter(|t| t.flagged()).count();
+        if let Some(top) = args.top {
+            all.truncate(top);
+        }
+        text_result(&json!({
+            "observed_window_secs": window_secs,
+            "suspect_count": suspect_count,
+            "trends": all,
         }))
     }
 
