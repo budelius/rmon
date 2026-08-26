@@ -738,13 +738,13 @@ fn handle_key_health(app: &mut App, code: KeyCode) -> bool {
                 h.select_prev(len);
             }
         }
-        KeyCode::Char('r') => {
-            if !app.health.as_ref().is_some_and(HealthState::scanning) {
-                app.health = Some(HealthState::start(
-                    DEFAULT_WHEA_LOOKBACK_DAYS,
-                    DEFAULT_WHEA_MAX_EVENTS,
-                ));
-            }
+        // Guarded rather than unconditional: restarting mid-scan would
+        // orphan the running query and its result.
+        KeyCode::Char('r') if !app.health.as_ref().is_some_and(HealthState::scanning) => {
+            app.health = Some(HealthState::start(
+                DEFAULT_WHEA_LOOKBACK_DAYS,
+                DEFAULT_WHEA_MAX_EVENTS,
+            ));
         }
         _ => {}
     }

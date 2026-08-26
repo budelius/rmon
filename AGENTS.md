@@ -16,11 +16,23 @@ rMon is a Windows-only Rust workspace for process CPU/GPU monitoring. Keep share
 Run commands from the workspace root. A native Windows MSVC toolchain is required because `rmon-core` uses Win32, WMI, PDH, and NVML APIs.
 
 ```powershell
+rustup update stable          # CI installs stable fresh on every run
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets
 ```
+
+Update the toolchain before trusting a green clippy run. `.gitlab-ci.yml`
+bootstraps `stable` from scratch each pipeline, so CI is always on the
+newest release while a dev machine can sit several behind — and clippy
+gains lints in every one of them. A local pass on an older toolchain is not
+evidence the build job will pass; it has already cost a red pipeline over
+a lint that did not exist locally.
+
+`-D warnings` also stops at the first crate that trips, which hides the
+rest. To see everything in one go, drop the deny flag:
+`cargo clippy --workspace --all-targets` and read all the warnings.
 
 For a quick CLI run:
 

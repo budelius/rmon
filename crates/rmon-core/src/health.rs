@@ -264,7 +264,7 @@ fn query_whea_events(lookback_days: i64, max_events: usize) -> Result<Vec<WheaEv
 
     // The query already returns newest first; sorting makes that a
     // guarantee of this function rather than of the flag we passed.
-    events.sort_by(|a, b| b.time.cmp(&a.time));
+    events.sort_by_key(|e| std::cmp::Reverse(e.time));
     Ok(events)
 }
 
