@@ -270,6 +270,7 @@ mod tests {
                 gpu_source: GpuSource::Unavailable,
                 user: None,
                 command_line: None,
+                executable_path: None,
                 handle_count: Some(handles),
                 mem_bytes: Some(1024),
             }],

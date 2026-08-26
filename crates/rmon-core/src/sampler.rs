@@ -92,6 +92,7 @@ impl Sampler {
                     gpu_source,
                     user: info.user,
                     command_line: info.command_line,
+                    executable_path: info.executable_path,
                     // Both come free with the SystemProcessInformation
                     // walk — no per-process syscalls on the tick path.
                     handle_count: info.handle_count,

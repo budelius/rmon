@@ -35,11 +35,27 @@ pub struct CredentialsEditor {
     /// Model ids from the gateway, once fetched.
     models: Vec<String>,
     models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Whether the user wants the key gated behind Windows Hello.
+    hello_enabled: bool,
+    /// Whether this machine has Hello enrolled at all. Probed once: the
+    /// answer cannot change while rMon is running, and probing per frame
+    /// would mean a WinRT round trip per repaint.
+    hello_available: bool,
+    /// `Some` while a save is waiting on a Hello gesture.
+    save_rx: Option<mpsc::Receiver<Result<Settings, String>>>,
 }
 
 enum Status {
     Ok(String),
     Err(String),
+}
+
+/// Which direction a gesture-bearing save is going.
+enum SaveKind {
+    /// Seal this plaintext under Windows Hello.
+    ToHello(String),
+    /// Release the sealed key with a gesture and re-seal it unprotected.
+    FromHello,
 }
 
 impl CredentialsEditor {
@@ -52,6 +68,7 @@ impl CredentialsEditor {
             Err(e) => (Settings::default(), Some(Status::Err(format!("{e:#}")))),
         };
         Self {
+            hello_enabled: settings.llm.requires_hello(),
             model_input: settings.llm.model.clone().unwrap_or_default(),
             base_url_input: settings.llm.base_url.clone().unwrap_or_default(),
             settings,
@@ -59,12 +76,20 @@ impl CredentialsEditor {
             status: None.or(status),
             models: Vec::new(),
             models_rx: None,
+            hello_available: rmon_core::hello::is_available(),
+            save_rx: None,
         }
     }
 
-    /// Whether a model fetch is in flight, so the app keeps repainting.
+    /// Whether the stored key needs a gesture before it can be read.
+    pub fn requires_hello(&self) -> bool {
+        self.settings.llm.requires_hello()
+    }
+
+    /// Whether a model fetch or a Hello gesture is in flight, so the app
+    /// keeps repainting.
     pub fn fetching(&self) -> bool {
-        self.models_rx.is_some()
+        self.models_rx.is_some() || self.save_rx.is_some()
     }
 
     /// Collects a finished model fetch. Called once per frame from the app's
@@ -83,6 +108,39 @@ impl CredentialsEditor {
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => self.models_rx = None,
+        }
+    }
+
+    /// Collects a finished Hello-gated save. Returns true when the stored
+    /// settings changed, mirroring [`Self::draw`]'s contract.
+    #[must_use]
+    pub fn poll_save(&mut self) -> bool {
+        let Some(rx) = &self.save_rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(settings)) => {
+                self.settings = settings;
+                self.hello_enabled = self.settings.llm.requires_hello();
+                self.key_input.clear();
+                self.status = Some(Status::Ok("saved behind Windows Hello".into()));
+                self.save_rx = None;
+                true
+            }
+            Ok(Err(e)) => {
+                // The checkbox goes back to what is actually stored, so a
+                // cancelled gesture does not leave the UI claiming a
+                // protection that was never applied.
+                self.hello_enabled = self.settings.llm.requires_hello();
+                self.status = Some(Status::Err(e));
+                self.save_rx = None;
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.save_rx = None;
+                false
+            }
         }
     }
 
@@ -167,8 +225,26 @@ impl CredentialsEditor {
         });
 
         ui.add_space(4.0);
+        if self.hello_available {
+            ui.checkbox(
+                &mut self.hello_enabled,
+                "Require Windows Hello to use this key",
+            )
+            .on_hover_text(
+                "Seals the key so reading it needs a face, fingerprint, or PIN.                  Resetting your PIN or clearing the TPM destroys the seal and the                  key has to be entered again.",
+            );
+        } else {
+            ui.weak("Windows Hello is not set up on this machine.");
+        }
+
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
+            let busy = self.save_rx.is_some();
+            if busy {
+                ui.spinner();
+                ui.weak("waiting for your Windows Hello gesture…");
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Save")).clicked() {
                 changed = self.save();
             }
             let stored = self.settings.llm.has_api_key();
@@ -235,20 +311,82 @@ impl CredentialsEditor {
         });
     }
 
+    /// Applies the form.
+    ///
+    /// Returns true only when the settings are already on disk. Anything that
+    /// needs a Windows Hello gesture returns false and finishes later through
+    /// [`Self::poll_save`], because the gesture blocks until the user answers
+    /// and must not run on the UI thread.
     fn save(&mut self) -> bool {
         let typed = self.key_input.trim().to_string();
+        let mut next = self.settings.clone();
+        next.llm.model = non_empty(&self.model_input);
+        next.llm.base_url = non_empty(&self.base_url_input);
+
+        let currently = next.llm.requires_hello();
+        let wanted = self.hello_enabled && self.hello_available;
+
+        if wanted {
+            // Already protected and no replacement typed: only the model and
+            // endpoint changed, so there is nothing to re-seal and no reason
+            // to make the user authenticate.
+            if currently && typed.is_empty() {
+                return self.write(next);
+            }
+            // Sealing needs the plaintext. Prefer what was just typed; else
+            // lift it out of the existing unprotected blob.
+            let plaintext = if typed.is_empty() {
+                match next.llm.api_key() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        self.status = Some(Status::Err(format!("{e:#}")));
+                        return false;
+                    }
+                }
+            } else {
+                Some(typed)
+            };
+            let Some(plaintext) = plaintext else {
+                self.status = Some(Status::Err(
+                    "enter a key before requiring Windows Hello".into(),
+                ));
+                self.hello_enabled = false;
+                return false;
+            };
+            self.start_hello_save(next, SaveKind::ToHello(plaintext));
+            return false;
+        }
+
+        if currently {
+            // Turning the protection off. A newly typed key replaces the
+            // sealed one outright; otherwise the old one has to be released
+            // by a gesture before it can be re-sealed unprotected.
+            if typed.is_empty() {
+                self.start_hello_save(next, SaveKind::FromHello);
+                return false;
+            }
+            if let Err(e) = next.llm.set_api_key(&typed) {
+                self.status = Some(Status::Err(format!("could not encrypt the key: {e:#}")));
+                return false;
+            }
+            next.llm.api_key_hello = None;
+            return self.write(next);
+        }
+
         if !typed.is_empty()
-            && let Err(e) = self.settings.llm.set_api_key(&typed)
+            && let Err(e) = next.llm.set_api_key(&typed)
         {
             self.status = Some(Status::Err(format!("could not encrypt the key: {e:#}")));
             return false;
         }
+        self.write(next)
+    }
 
-        self.settings.llm.model = non_empty(&self.model_input);
-        self.settings.llm.base_url = non_empty(&self.base_url_input);
-
-        match config::save(&self.settings) {
+    /// Commits `next` to disk and adopts it.
+    fn write(&mut self, next: Settings) -> bool {
+        match config::save(&next) {
             Ok(()) => {
+                self.settings = next;
                 self.key_input.clear();
                 self.status = Some(Status::Ok("saved".into()));
                 true
@@ -260,10 +398,37 @@ impl CredentialsEditor {
         }
     }
 
+    /// Runs a gesture-bearing save on a worker thread.
+    fn start_hello_save(&mut self, mut next: Settings, kind: SaveKind) {
+        let (tx, rx) = mpsc::channel();
+        self.save_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<Settings> {
+                match kind {
+                    SaveKind::ToHello(plaintext) => {
+                        next.llm.set_api_key_with_hello(&plaintext)?;
+                    }
+                    SaveKind::FromHello => {
+                        let plaintext = next.llm.unlock_with_hello()?;
+                        next.llm.set_api_key(&plaintext)?;
+                        next.llm.api_key_hello = None;
+                    }
+                }
+                config::save(&next)?;
+                Ok(next)
+            })()
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+    }
+
     fn clear_key(&mut self) -> bool {
         // Cannot fail: clearing takes the blank-input branch, which only
-        // assigns None.
+        // assigns None. Both seal forms go, or "Clear key" would leave one
+        // of them behind.
         let _ = self.settings.llm.set_api_key("");
+        self.settings.llm.api_key_hello = None;
+        self.hello_enabled = false;
         match config::save(&self.settings) {
             Ok(()) => {
                 self.status = Some(Status::Ok("key forgotten".into()));

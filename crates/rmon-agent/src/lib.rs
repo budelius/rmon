@@ -73,6 +73,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub enum Source {
     /// The settings tab, via `%APPDATA%\rMon\config.json`.
     Saved,
+    /// The settings tab, unsealed this session with a Windows Hello gesture.
+    Hello,
     /// An environment variable, named.
     Env(&'static str),
 }
@@ -81,6 +83,7 @@ impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Saved => f.write_str("saved settings"),
+            Self::Hello => f.write_str("saved settings, unlocked with Windows Hello"),
             Self::Env(var) => f.write_str(var),
         }
     }
@@ -110,9 +113,9 @@ impl AgentConfig {
     ///
     /// The key is still never written to the SQLite store, and on disk it
     /// exists only as a DPAPI blob — see [`rmon_core::config`].
-    pub fn resolve() -> Result<Self> {
+    pub fn resolve(unlocked: Option<&str>) -> Result<Self> {
         let saved = rmon_core::config::load().map(|s| s.llm).unwrap_or_default();
-        Self::from_saved_or_env(&saved, &|var| std::env::var(var).ok())
+        Self::from_saved_or_env(&saved, unlocked, &|var| std::env::var(var).ok())
     }
 
     /// [`Self::resolve`] with both global inputs injected.
@@ -120,8 +123,13 @@ impl AgentConfig {
     /// The saved file and the process environment are both global mutable
     /// state, so the precedence rules are tested through here rather than
     /// by mutating either.
+    /// `unlocked` is the plaintext already obtained this session by a
+    /// Windows Hello gesture, if any. It is passed in rather than fetched
+    /// here because obtaining it blocks on the user, which has to happen on
+    /// a worker thread and at most once per session — not on every question.
     pub fn from_saved_or_env(
         saved: &LlmSettings,
+        unlocked: Option<&str>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let non_empty = |s: String| Some(s).filter(|v| !v.trim().is_empty());
@@ -131,8 +139,18 @@ impl AgentConfig {
         // key found" for a user who can see their key in the settings tab.
         let saved_key = saved.api_key().context("reading the saved API key")?;
 
-        let (api_key, key_source) = match saved_key {
-            Some(k) => (k, Source::Saved),
+        let (api_key, key_source) = match unlocked
+            .filter(|k| !k.trim().is_empty())
+            .map(|k| (k.to_string(), Source::Hello))
+            .or_else(|| saved_key.map(|k| (k, Source::Saved)))
+        {
+            Some(pair) => pair,
+            // A key sealed behind Hello is present but unreadable until the
+            // user consents. That is a different state from having no key,
+            // and must not fall through to the environment.
+            None if saved.requires_hello() => {
+                bail!("the saved key is protected by Windows Hello — unlock it to continue")
+            }
             None => {
                 let found = API_KEY_VARS
                     .iter()
@@ -175,8 +193,8 @@ impl AgentConfig {
 
     /// Whether an agent could be constructed, without constructing one.
     /// Used by the UI to explain itself before the user tries.
-    pub fn describe_availability() -> std::result::Result<String, String> {
-        match Self::resolve() {
+    pub fn describe_availability(unlocked: Option<&str>) -> std::result::Result<String, String> {
+        match Self::resolve(unlocked) {
             Ok(c) => Ok(format!(
                 "{} via {} (key from {})",
                 c.model, c.base_url, c.key_source
@@ -213,11 +231,24 @@ You are the analysis assistant built into rMon, a Windows process monitor. You \
 help the user work out why their machine is slow, using only the telemetry \
 rMon gives you through tools.
 
-Method:
+Method for performance questions:
 - Call system_metrics first. If the CPU or GPU is being throttled, every \
 per-process CPU% and GPU% figure is measuring the limit rather than the \
 workload, and you must say so before blaming any process.
 - Then look at the processes, and at trend_suspects for leaks and idle burners.
+
+Method for software identity, purpose, or suspicion questions:
+- Use process_detail and program_detail. Identity comes from executable path, \
+installer publisher/location, command line, and the parent/child chain — never \
+from a familiar filename alone.
+- Explain the software's ordinary purpose when you know it, then separate that \
+general knowledge from what rMon measured on this machine.
+- Registry presence is not a trust verdict. Missing publisher metadata, an \
+unattributed process, or an unsigned/unknown binary is a reason to verify, not \
+proof of malware. Give concrete read-only verification commands when useful.
+- Windows uninstall entries do not provide a complete package dependency graph \
+or reliable last-used time. Never call an app safe to uninstall merely because \
+it is idle now; name known dependents/current children and say what remains unknown.
 - Prefer few, targeted tool calls over enumerating everything.
 
 Reporting:
@@ -447,6 +478,7 @@ mod tests {
                     gpu_source: rmon_core::GpuSource::Unavailable,
                     user: None,
                     command_line: None,
+                    executable_path: Some(r"C:\Apps\busy.exe".into()),
                     handle_count: None,
                     mem_bytes: None,
                 }],
@@ -454,6 +486,7 @@ mod tests {
             },
             trends: Vec::new(),
             throttle: ThrottleSummary::default(),
+            installed_programs: Vec::new(),
         }
     }
 
@@ -594,7 +627,7 @@ mod tests {
         let saved = saved_with_key("sk-saved");
         let env = env_of(&[("RMON_LLM_API_KEY", "sk-env"), ("RMON_LLM_MODEL", "m")]);
 
-        let config = AgentConfig::from_saved_or_env(&saved, &env).unwrap();
+        let config = AgentConfig::from_saved_or_env(&saved, None, &env).unwrap();
 
         assert_eq!(config.api_key, "sk-saved");
         assert_eq!(config.key_source, Source::Saved);
@@ -604,7 +637,7 @@ mod tests {
     fn environment_is_the_fallback_when_nothing_is_saved() {
         let env = env_of(&[("OPENAI_API_KEY", "sk-env"), ("RMON_LLM_MODEL", "m")]);
 
-        let config = AgentConfig::from_saved_or_env(&LlmSettings::default(), &env).unwrap();
+        let config = AgentConfig::from_saved_or_env(&LlmSettings::default(), None, &env).unwrap();
 
         assert_eq!(config.api_key, "sk-env");
         assert_eq!(config.key_source, Source::Env("OPENAI_API_KEY"));
@@ -619,7 +652,7 @@ mod tests {
             ("RMON_LLM_MODEL", "m"),
         ]);
 
-        let config = AgentConfig::from_saved_or_env(&LlmSettings::default(), &env).unwrap();
+        let config = AgentConfig::from_saved_or_env(&LlmSettings::default(), None, &env).unwrap();
 
         assert_eq!(config.api_key, "sk-first");
         assert_eq!(config.key_source, Source::Env("RMON_LLM_API_KEY"));
@@ -635,7 +668,7 @@ mod tests {
             ("RMON_LLM_BASE_URL", "https://elsewhere/v1"),
         ]);
 
-        let config = AgentConfig::from_saved_or_env(&saved, &env).unwrap();
+        let config = AgentConfig::from_saved_or_env(&saved, None, &env).unwrap();
 
         assert_eq!(config.model, "claude-opus");
         assert_eq!(config.base_url, "https://gateway-dev.mezzanin.eu/v1");
@@ -646,7 +679,7 @@ mod tests {
         let saved = saved_with_key("sk-saved");
         let env = env_of(&[("RMON_LLM_MODEL", "m")]);
 
-        let config = AgentConfig::from_saved_or_env(&saved, &env).unwrap();
+        let config = AgentConfig::from_saved_or_env(&saved, None, &env).unwrap();
 
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
     }
@@ -663,7 +696,7 @@ mod tests {
             ("RMON_LLM_BASE_URL", "https://elsewhere/v1"),
         ]);
 
-        let config = AgentConfig::from_saved_or_env(&saved, &env).unwrap();
+        let config = AgentConfig::from_saved_or_env(&saved, None, &env).unwrap();
 
         assert_eq!(config.model, "gpt-5.4");
         assert_eq!(config.base_url, "https://elsewhere/v1");
@@ -673,7 +706,7 @@ mod tests {
     fn a_missing_key_points_at_settings_first() {
         let env = env_of(&[("RMON_LLM_MODEL", "m")]);
 
-        let err = AgentConfig::from_saved_or_env(&LlmSettings::default(), &env).unwrap_err();
+        let err = AgentConfig::from_saved_or_env(&LlmSettings::default(), None, &env).unwrap_err();
 
         let text = format!("{err:#}");
         assert!(text.contains("Settings"), "{text}");
@@ -684,7 +717,7 @@ mod tests {
     fn a_missing_model_is_reported_separately_from_a_missing_key() {
         let saved = saved_with_key("sk-saved");
 
-        let err = AgentConfig::from_saved_or_env(&saved, &env_of(&[])).unwrap_err();
+        let err = AgentConfig::from_saved_or_env(&saved, None, &env_of(&[])).unwrap_err();
 
         let text = format!("{err:#}");
         assert!(text.contains("model"), "{text}");
@@ -701,8 +734,76 @@ mod tests {
         };
         let env = env_of(&[("RMON_LLM_API_KEY", "sk-env"), ("RMON_LLM_MODEL", "m")]);
 
-        let err = AgentConfig::from_saved_or_env(&saved, &env).unwrap_err();
+        let err = AgentConfig::from_saved_or_env(&saved, None, &env).unwrap_err();
 
         assert!(format!("{err:#}").contains("saved API key"), "{err:#}");
+    }
+
+    /// A settings object whose key is sealed behind Hello, built without
+    /// touching the real Hello store — only `requires_hello` is consulted.
+    fn saved_behind_hello() -> LlmSettings {
+        LlmSettings {
+            api_key_hello: Some(rmon_core::config::HelloSealed {
+                challenge: "00".into(),
+                blob: "00".into(),
+            }),
+            model: Some("m".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The important negative case: a Hello-protected key must not silently
+    /// fall through to an environment variable. Doing so would hand the agent
+    /// a different key than the one the user believes is in use, and would
+    /// quietly defeat the protection they turned on.
+    #[test]
+    fn a_hello_locked_key_does_not_fall_through_to_the_environment() {
+        let env = env_of(&[("RMON_LLM_API_KEY", "sk-env"), ("RMON_LLM_MODEL", "m")]);
+
+        let err = AgentConfig::from_saved_or_env(&saved_behind_hello(), None, &env).unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(text.contains("Windows Hello"), "{text}");
+        assert!(text.contains("unlock"), "{text}");
+    }
+
+    #[test]
+    fn a_session_unlock_satisfies_a_hello_locked_key() {
+        let env = env_of(&[("RMON_LLM_API_KEY", "sk-env")]);
+
+        let config =
+            AgentConfig::from_saved_or_env(&saved_behind_hello(), Some("sk-unlocked"), &env)
+                .unwrap();
+
+        assert_eq!(config.api_key, "sk-unlocked");
+        assert_eq!(config.key_source, Source::Hello);
+        assert_eq!(config.model, "m");
+    }
+
+    /// The unlocked value outranks a plain saved blob too, so that turning
+    /// Hello on mid-session takes effect rather than silently using the old
+    /// unprotected copy.
+    #[test]
+    fn a_session_unlock_outranks_the_plain_saved_key() {
+        let mut saved = saved_with_key("sk-plain");
+        saved.model = Some("m".into());
+
+        let config =
+            AgentConfig::from_saved_or_env(&saved, Some("sk-unlocked"), &env_of(&[])).unwrap();
+
+        assert_eq!(config.api_key, "sk-unlocked");
+        assert_eq!(config.key_source, Source::Hello);
+    }
+
+    /// A blank unlock is the state of "not unlocked yet" and must not be
+    /// mistaken for a key.
+    #[test]
+    fn a_blank_unlock_is_not_a_key() {
+        let env = env_of(&[("RMON_LLM_MODEL", "m")]);
+
+        let err =
+            AgentConfig::from_saved_or_env(&saved_behind_hello(), Some("   "), &env).unwrap_err();
+
+        assert!(format!("{err:#}").contains("Windows Hello"), "{err:#}");
     }
 }

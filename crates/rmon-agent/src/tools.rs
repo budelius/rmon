@@ -35,6 +35,10 @@ pub struct ToolContext {
     pub snapshot: Snapshot,
     pub trends: Vec<rmon_core::trends::ProcessTrend>,
     pub throttle: ThrottleSummary,
+    /// Conventional Win32/MSI uninstall inventory. It is captured with the
+    /// process snapshot so software identity questions use one consistent
+    /// view rather than rescanning midway through a turn.
+    pub installed_programs: Vec<rmon_core::InstalledProgram>,
 }
 
 /// The throttle history, already reduced — the agent does not need the
@@ -54,6 +58,7 @@ impl ToolContext {
         Self {
             trends: rmon_core::trends::analyze(history),
             throttle: ThrottleSummary::default(),
+            installed_programs: rmon_core::list_installed_programs().programs,
             snapshot,
         }
     }
@@ -125,6 +130,31 @@ pub fn specs() -> Vec<ToolSpec> {
             json!({"type": "object", "properties": {}}),
         ),
         spec(
+            "installed_programs",
+            "Search the Windows installed-program inventory and report current inclusive \
+             process/resource activity. The inventory covers conventional Win32/MSI \
+             uninstall entries; absence is not proof that a portable or Store app is absent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Optional name, publisher, version, or path substring"},
+                    "only_active": {"type": "boolean", "description": "Return only programs with a matched process or launched child"},
+                    "limit": {"type": "integer", "description": "Maximum entries (default 30, max 100)"}
+                }
+            }),
+        ),
+        spec(
+            "program_detail",
+            "Installed-program metadata, known registry parent/dependent relationships, \
+             and live processes attributed by executable path and parent chain. Windows \
+             uninstall metadata is not a complete software dependency graph.",
+            json!({
+                "type": "object",
+                "properties": {"id_or_name": {"type": "string", "description": "Exact inventory id or program display name"}},
+                "required": ["id_or_name"]
+            }),
+        ),
+        spec(
             "propose_kill_process",
             "Propose terminating a process. This does NOT kill anything: it returns a \
              proposal that a human must approve in the UI. Use it only when a specific \
@@ -172,6 +202,18 @@ struct KillArgs {
     reason: String,
 }
 
+#[derive(Deserialize, Default)]
+struct ProgramListArgs {
+    query: Option<String>,
+    only_active: Option<bool>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ProgramDetailArgs {
+    id_or_name: String,
+}
+
 /// Runs one tool call against the captured machine state.
 pub fn dispatch(
     ctx: &ToolContext,
@@ -196,6 +238,14 @@ pub fn dispatch(
             Ok(ToolOutcome::Value(process_detail(ctx, a.pid)))
         }
         "trend_suspects" => Ok(ToolOutcome::Value(trend_suspects(ctx))),
+        "installed_programs" => {
+            let a: ProgramListArgs = serde_json::from_str(args).unwrap_or_default();
+            Ok(ToolOutcome::Value(installed_programs(ctx, a)))
+        }
+        "program_detail" => {
+            let a: ProgramDetailArgs = serde_json::from_str(args)?;
+            Ok(ToolOutcome::Value(program_detail(ctx, &a.id_or_name)))
+        }
         "propose_kill_process" => {
             let a: KillArgs = serde_json::from_str(args)?;
             let process_name = ctx
@@ -285,7 +335,9 @@ fn top_processes(ctx: &ToolContext, args: TopArgs) -> Value {
         "sorted_by": key,
         "processes": procs.iter().take(limit).map(|p| json!({
             "pid": p.pid,
+            "parent_pid": p.ppid,
             "name": p.name,
+            "executable_path": p.executable_path,
             "cpu_percent": p.cpu_percent,
             "gpu_percent": p.gpu_percent,
             "memory_bytes": p.mem_bytes,
@@ -312,12 +364,218 @@ fn process_detail(ctx: &ToolContext, pid: u32) -> Value {
         "handle_count": p.handle_count,
         "user": p.user,
         "command_line": p.command_line,
+        "executable_path": p.executable_path,
+        "parent": p.ppid.and_then(|parent_pid| ctx.snapshot.processes.iter()
+            .find(|candidate| candidate.pid == parent_pid)
+            .map(|parent| json!({"pid": parent.pid, "name": parent.name, "path": parent.executable_path}))),
+        "children": ctx.snapshot.processes.iter()
+            .filter(|child| child.ppid == Some(pid))
+            .map(|child| json!({
+                "pid": child.pid,
+                "name": child.name,
+                "path": child.executable_path,
+                "cpu_percent": child.cpu_percent,
+                "gpu_percent": child.gpu_percent,
+            }))
+            .collect::<Vec<_>>(),
+        "attention_reasons": rmon_core::process_attention_reasons(p),
         "trend": trend.map(|t| json!({
             "handle_leak_suspect": t.handle_leak_suspect,
             "memory_leak_suspect": t.mem_leak_suspect,
             "idle_burner": t.idle_burner,
             "verdict": t.verdict,
         })),
+    })
+}
+
+fn installed_programs(ctx: &ToolContext, args: ProgramListArgs) -> Value {
+    let attribution =
+        rmon_core::attribute_processes(&ctx.installed_programs, &ctx.snapshot.processes);
+    let activity: std::collections::HashMap<_, _> = attribution
+        .activities
+        .iter()
+        .map(|activity| (activity.program_id.as_str(), activity))
+        .collect();
+    let query = args.query.unwrap_or_default().to_ascii_lowercase();
+    let only_active = args.only_active.unwrap_or(false);
+    let limit = args.limit.unwrap_or(30).clamp(1, 100);
+    let mut programs: Vec<_> = ctx
+        .installed_programs
+        .iter()
+        .filter(|program| {
+            query.is_empty()
+                || program.name.to_ascii_lowercase().contains(&query)
+                || program
+                    .publisher
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+                || program
+                    .version
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+                || program
+                    .install_location
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+        })
+        .filter(|program| {
+            !only_active
+                || activity
+                    .get(program.id.as_str())
+                    .is_some_and(|activity| activity.active())
+        })
+        .collect();
+    programs.sort_by(|a, b| {
+        let active = |program: &rmon_core::InstalledProgram| {
+            activity
+                .get(program.id.as_str())
+                .is_some_and(|activity| activity.active())
+        };
+        active(b).cmp(&active(a)).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
+    });
+
+    json!({
+        "programs": programs.into_iter().take(limit).map(|program| {
+            let current = activity.get(program.id.as_str()).copied();
+            json!({
+                "id": program.id,
+                "name": program.name,
+                "version": program.version,
+                "publisher": program.publisher,
+                "install_location": program.install_location,
+                "scope": program.scope.as_str(),
+                "active_processes_including_launched_children": current.map_or(0, |a| a.process_count()),
+                "inclusive_cpu_percent": current.map_or(0.0, |a| a.cpu_percent),
+                "inclusive_gpu_percent": current.map_or(0.0, |a| a.gpu_percent),
+                "inclusive_memory_bytes": current.map_or(0, |a| a.memory_bytes),
+                "attention_reasons": program.attention_reasons(),
+            })
+        }).collect::<Vec<_>>(),
+        "total_inventory_entries": ctx.installed_programs.len(),
+        "coverage_note": "Conventional Win32/MSI uninstall entries only; not a complete inventory of portable or Store software.",
+    })
+}
+
+fn program_detail(ctx: &ToolContext, id_or_name: &str) -> Value {
+    let query = id_or_name.trim();
+    let program = ctx
+        .installed_programs
+        .iter()
+        .find(|program| program.id.eq_ignore_ascii_case(query))
+        .or_else(|| {
+            ctx.installed_programs
+                .iter()
+                .find(|program| program.name.eq_ignore_ascii_case(query))
+        });
+    let Some(program) = program else {
+        return json!({"error": format!("no installed-program entry named {query:?}")});
+    };
+
+    let relationships = rmon_core::program_relationships(&ctx.installed_programs);
+    let parent = relationships
+        .iter()
+        .find(|relationship| relationship.dependent_id == program.id)
+        .and_then(|relationship| {
+            ctx.installed_programs
+                .iter()
+                .find(|candidate| candidate.id == relationship.parent_id)
+        });
+    let dependents: Vec<_> = relationships
+        .iter()
+        .filter(|relationship| relationship.parent_id == program.id)
+        .filter_map(|relationship| {
+            ctx.installed_programs
+                .iter()
+                .find(|candidate| candidate.id == relationship.dependent_id)
+        })
+        .collect();
+
+    let attribution =
+        rmon_core::attribute_processes(&ctx.installed_programs, &ctx.snapshot.processes);
+    let activity = attribution
+        .activities
+        .iter()
+        .find(|activity| activity.program_id == program.id);
+    let active_pids = activity
+        .map(rmon_core::ProgramActivity::all_pids)
+        .unwrap_or_default();
+    let links: std::collections::HashMap<_, _> = attribution
+        .links
+        .iter()
+        .map(|link| (link.pid, link))
+        .collect();
+    let live_processes: Vec<_> = ctx
+        .snapshot
+        .processes
+        .iter()
+        .filter(|process| active_pids.contains(&process.pid))
+        .map(|process| {
+            let link = links.get(&process.pid).copied();
+            json!({
+                "pid": process.pid,
+                "parent_pid": process.ppid,
+                "name": process.name,
+                "path": process.executable_path,
+                "command_line": process.command_line,
+                "cpu_percent": process.cpu_percent,
+                "gpu_percent": process.gpu_percent,
+                "memory_bytes": process.mem_bytes,
+                "direct_program_executable": link.and_then(|link| link.direct_program_id.as_deref()) == Some(program.id.as_str()),
+                "launched_by_program_process": link.and_then(|link| link.launcher_program_id.as_deref()) == Some(program.id.as_str()),
+                "attention_reasons": rmon_core::process_attention_reasons(process),
+            })
+        })
+        .collect();
+
+    let mut removal_blockers = Vec::new();
+    if activity.is_some_and(|activity| activity.active()) {
+        removal_blockers.push("the program or a child it launched is running now".to_string());
+    }
+    if !dependents.is_empty() {
+        removal_blockers.push("Windows records dependent uninstall entries".to_string());
+    }
+    if program.system_component {
+        removal_blockers.push("installer marks this as a system component".to_string());
+    }
+    if program.update_or_hotfix {
+        removal_blockers.push("entry is an update or hotfix".to_string());
+    }
+    if !program.has_uninstaller() {
+        removal_blockers.push("no enabled uninstall command is registered".to_string());
+    }
+
+    json!({
+        "id": program.id,
+        "name": program.name,
+        "version": program.version,
+        "publisher": program.publisher,
+        "comments": program.comments,
+        "website": program.website,
+        "install_location": program.install_location,
+        "install_date": program.install_date,
+        "estimated_size_bytes": program.estimated_size_bytes,
+        "scope": program.scope.as_str(),
+        "registry_view": program.registry_view,
+        "windows_installer": program.windows_installer,
+        "system_component": program.system_component,
+        "update_or_hotfix": program.update_or_hotfix,
+        "has_registered_uninstaller": program.has_uninstaller(),
+        "known_registry_parent": parent.map(|parent| json!({"id": parent.id, "name": parent.name})),
+        "known_registry_dependents": dependents.iter().map(|dependent| json!({"id": dependent.id, "name": dependent.name})).collect::<Vec<_>>(),
+        "live_processes": live_processes,
+        "inclusive_activity": activity.map(|activity| json!({
+            "process_count": activity.process_count(),
+            "cpu_percent": activity.cpu_percent,
+            "gpu_percent": activity.gpu_percent,
+            "memory_bytes": activity.memory_bytes,
+        })),
+        "attention_reasons": program.attention_reasons(),
+        "removal_review_blockers": removal_blockers,
+        "removal_caveat": "No blockers means reviewable, not safe to remove. Windows does not expose complete dependency or reliable last-used data; confirm project/config usage and make a restore/backup plan.",
     })
 }
 
@@ -349,7 +607,8 @@ fn trend_suspects(ctx: &ToolContext) -> Value {
 mod tests {
     use super::*;
     use rmon_core::{
-        BoardTemperatureSample, FanSample, GpuSource, ProcessSample, SystemMetrics, VoltageSample,
+        BoardTemperatureSample, FanSample, GpuSource, InstalledProgram, ProcessSample,
+        ProgramScope, SystemMetrics, VoltageSample,
     };
 
     fn ctx() -> ToolContext {
@@ -387,6 +646,7 @@ mod tests {
                         gpu_source: GpuSource::Unavailable,
                         user: None,
                         command_line: None,
+                        executable_path: Some(r"C:\Apps\busy.exe".into()),
                         handle_count: Some(100),
                         mem_bytes: Some(1024),
                     },
@@ -399,6 +659,7 @@ mod tests {
                         gpu_source: GpuSource::Unavailable,
                         user: None,
                         command_line: None,
+                        executable_path: Some(r"C:\Apps\fat.exe".into()),
                         handle_count: Some(10),
                         mem_bytes: Some(999_999),
                     },
@@ -410,7 +671,55 @@ mod tests {
                 observed_secs: 60,
                 fraction_limited: None,
             },
+            installed_programs: Vec::new(),
         }
+    }
+
+    fn installed_program() -> InstalledProgram {
+        InstalledProgram {
+            id: "machine:64-bit:busy".into(),
+            registry_key: "busy".into(),
+            name: "Busy Suite".into(),
+            version: Some("1.2.3".into()),
+            publisher: Some("Example Corp".into()),
+            install_location: Some(r"C:\Apps".into()),
+            install_date: None,
+            display_icon: None,
+            comments: Some("Example test program".into()),
+            website: None,
+            estimated_size_bytes: None,
+            scope: ProgramScope::AllUsers,
+            registry_view: "64-bit".into(),
+            uninstall_command: Some("uninstall.exe".into()),
+            quiet_uninstall_command: None,
+            system_component: false,
+            update_or_hotfix: false,
+            windows_installer: false,
+            no_remove: false,
+            parent_key_name: None,
+        }
+    }
+
+    #[test]
+    fn program_detail_carries_identity_activity_and_removal_caveat() {
+        let mut ctx = ctx();
+        ctx.installed_programs.push(installed_program());
+        let value = match dispatch(
+            &ctx,
+            "c",
+            "program_detail",
+            r#"{"id_or_name":"Busy Suite"}"#,
+        ) {
+            Ok(ToolOutcome::Value(value)) => value,
+            _ => panic!("expected a value"),
+        };
+        assert_eq!(value["publisher"], "Example Corp");
+        assert_eq!(value["inclusive_activity"]["process_count"], 2);
+        assert!(
+            value["removal_caveat"]
+                .as_str()
+                .is_some_and(|note| note.contains("not safe"))
+        );
     }
 
     #[test]

@@ -63,6 +63,26 @@ pub struct LlmSettings {
     /// OpenAI-compatible `/v1` base. Absent means the built-in default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// The same key sealed so that opening it also needs a Windows Hello
+    /// gesture. Mutually exclusive with [`Self::api_key_sealed`]: leaving the
+    /// plain blob behind when Hello is turned on would keep a way past the
+    /// gesture, which is the entire point of turning it on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_hello: Option<HelloSealed>,
+}
+
+/// A key sealed under DPAPI with a Windows Hello signature as its entropy.
+///
+/// Neither field is a secret on its own. The challenge is random public data,
+/// and the blob cannot be opened without both this user's DPAPI master key and
+/// a signature only a live gesture produces.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HelloSealed {
+    /// Hex; signed to derive the entropy.
+    pub challenge: String,
+    /// Hex; the DPAPI ciphertext.
+    pub blob: String,
 }
 
 impl LlmSettings {
@@ -76,8 +96,11 @@ impl LlmSettings {
         let Some(sealed) = &self.api_key_sealed else {
             return Ok(None);
         };
-        let bytes = unseal(&from_hex(sealed).context("stored key is not valid hex")?)
-            .context("stored key could not be decrypted for this user on this machine")?;
+        let bytes = unseal(
+            &from_hex(sealed).context("stored key is not valid hex")?,
+            ENTROPY,
+        )
+        .context("stored key could not be decrypted for this user on this machine")?;
         let key = String::from_utf8(bytes).context("stored key is not valid UTF-8")?;
         Ok(Some(key).filter(|k| !k.trim().is_empty()))
     }
@@ -89,13 +112,68 @@ impl LlmSettings {
             self.api_key_sealed = None;
             return Ok(());
         }
-        self.api_key_sealed = Some(to_hex(&seal(key.as_bytes())?));
+        self.api_key_sealed = Some(to_hex(&seal(key.as_bytes(), ENTROPY)?));
         Ok(())
     }
 
-    /// Whether a key is stored, without decrypting it.
+    /// Whether a key is stored in either form, without decrypting it.
     pub fn has_api_key(&self) -> bool {
-        self.api_key_sealed.is_some()
+        self.api_key_sealed.is_some() || self.api_key_hello.is_some()
+    }
+
+    /// Whether reading the key needs a Windows Hello gesture.
+    pub fn requires_hello(&self) -> bool {
+        self.api_key_hello.is_some()
+    }
+
+    /// Seals `key` behind Windows Hello, prompting for a gesture.
+    ///
+    /// Clears the plain DPAPI blob on success: keeping it would leave a copy
+    /// readable without the gesture, defeating the option the user just chose.
+    /// A blank key clears both.
+    ///
+    /// **Blocks on user interaction.** Never call this on a UI thread.
+    pub fn set_api_key_with_hello(&mut self, key: &str) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            self.api_key_sealed = None;
+            self.api_key_hello = None;
+            return Ok(());
+        }
+
+        let challenge = crate::hello::new_challenge()?;
+        let signature = crate::hello::sign(&challenge, true)?;
+        let blob = seal(key.as_bytes(), &signature)?;
+
+        self.api_key_hello = Some(HelloSealed {
+            challenge: to_hex(&challenge),
+            blob: to_hex(&blob),
+        });
+        self.api_key_sealed = None;
+        Ok(())
+    }
+
+    /// Decrypts the Hello-sealed key, prompting for a gesture.
+    ///
+    /// The credential is never created here — see [`crate::hello::sign`] for
+    /// why a missing one has to be an error rather than a fresh enrolment.
+    ///
+    /// **Blocks on user interaction.** Never call this on a UI thread.
+    pub fn unlock_with_hello(&self) -> Result<String> {
+        let sealed = self
+            .api_key_hello
+            .as_ref()
+            .ok_or_else(|| anyhow!("no Windows Hello key is stored"))?;
+
+        let challenge =
+            from_hex(&sealed.challenge).context("stored Hello challenge is not valid hex")?;
+        let blob = from_hex(&sealed.blob).context("stored Hello blob is not valid hex")?;
+        let signature = crate::hello::sign(&challenge, false)?;
+
+        let bytes = unseal(&blob, &signature).context(
+            "the stored key could not be decrypted — the Windows Hello credential              that sealed it has been replaced, so the key must be entered again",
+        )?;
+        String::from_utf8(bytes).context("stored key is not valid UTF-8")
     }
 }
 
@@ -140,13 +218,13 @@ pub fn save(settings: &Settings) -> Result<()> {
 }
 
 /// DPAPI-encrypts `plaintext` for the current user.
-fn seal(plaintext: &[u8]) -> Result<Vec<u8>> {
+fn seal(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: both input blobs borrow slices that outlive the call, and `out`
     // is filled in by DPAPI with a LocalAlloc buffer that `take` copies and
     // frees.
     unsafe {
         let input = blob(plaintext);
-        let entropy = blob(ENTROPY);
+        let entropy = blob(entropy);
         let mut out = CRYPT_INTEGER_BLOB::default();
         CryptProtectData(
             &input,
@@ -163,11 +241,11 @@ fn seal(plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// DPAPI-decrypts what [`seal`] produced.
-fn unseal(ciphertext: &[u8]) -> Result<Vec<u8>> {
+fn unseal(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: as in `seal`.
     unsafe {
         let input = blob(ciphertext);
-        let entropy = blob(ENTROPY);
+        let entropy = blob(entropy);
         let mut out = CRYPT_INTEGER_BLOB::default();
         CryptUnprotectData(
             &input,
@@ -312,5 +390,94 @@ mod tests {
             serde_json::from_str::<Settings>("{}").unwrap(),
             Settings::default()
         );
+    }
+
+    /// The property the whole Hello design rests on: entropy is not
+    /// decoration. A blob sealed under one signature must be unopenable under
+    /// any other, or the gesture gates nothing.
+    #[test]
+    fn a_blob_is_unopenable_under_different_entropy() {
+        let signature_a = vec![0xAB; 256];
+        let signature_b = vec![0xCD; 256];
+
+        let blob = seal(b"sk-hello-protected", &signature_a).unwrap();
+
+        assert_eq!(
+            unseal(&blob, &signature_a).unwrap(),
+            b"sk-hello-protected",
+            "the right entropy must still open it"
+        );
+        assert!(
+            unseal(&blob, &signature_b).is_err(),
+            "a different signature must not open it"
+        );
+        assert!(
+            unseal(&blob, ENTROPY).is_err(),
+            "the plain static entropy must not open a Hello-sealed blob"
+        );
+    }
+
+    /// And the converse: turning Hello on must not leave the plain blob
+    /// behind as a way around the gesture.
+    #[test]
+    fn the_two_seal_forms_are_mutually_exclusive() {
+        let mut llm = LlmSettings::default();
+        llm.set_api_key("sk-plain").unwrap();
+        assert!(llm.has_api_key() && !llm.requires_hello());
+
+        // Simulate what set_api_key_with_hello stores, without a gesture.
+        llm.api_key_hello = Some(HelloSealed {
+            challenge: to_hex(&[7u8; 32]),
+            blob: to_hex(&seal(b"sk-hello", &[9u8; 256]).unwrap()),
+        });
+        llm.api_key_sealed = None;
+
+        assert!(llm.requires_hello());
+        assert!(llm.has_api_key());
+        assert_eq!(
+            llm.api_key().unwrap(),
+            None,
+            "with no plain blob there is nothing to read without a gesture"
+        );
+    }
+
+    #[test]
+    fn hello_settings_serialise_without_the_plaintext_and_round_trip() {
+        let mut settings = Settings::default();
+        settings.llm.api_key_hello = Some(HelloSealed {
+            challenge: to_hex(&[1u8; 32]),
+            blob: to_hex(&seal(b"sk-secret-hello-key", &[2u8; 256]).unwrap()),
+        });
+
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        assert!(!json.contains("sk-secret-hello-key"), "{json}");
+        assert!(json.contains("api_key_hello"));
+        assert!(
+            !json.contains("api_key_sealed"),
+            "absent field must stay absent"
+        );
+
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+        assert!(back.llm.requires_hello());
+    }
+
+    #[test]
+    fn unlocking_without_a_stored_hello_key_is_an_error_not_a_prompt() {
+        let llm = LlmSettings::default();
+        let err = llm.unlock_with_hello().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no Windows Hello key"),
+            "{err:#}"
+        );
+    }
+
+    /// A config written by a build that had no Hello support must still load.
+    #[test]
+    fn configs_without_the_hello_field_still_load() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"llm":{"api_key_sealed":"00","model":"m"}}"#).unwrap();
+        assert!(!settings.llm.requires_hello());
+        assert!(settings.llm.has_api_key());
     }
 }

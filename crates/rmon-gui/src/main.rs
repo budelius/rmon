@@ -17,10 +17,12 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 use rmon_agent::{AgentConfig, AgentEvent, PendingAction, ThrottleSummary, ToolContext};
 use rmon_core::{
     AllFilesEntry, DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
-    DEFAULT_WHEA_MAX_EVENTS, GpuSource, HardwareHealthReport, OpenFilesScan, PortEntry,
-    ProcessSample, RollingHistory, ShortLivedWatcher, Store, SystemMetrics, ThrottleHistory,
-    build_tree, check_hardware_health, list_open_files, list_open_files_many, listening_ports_for,
-    merge_recent_exits,
+    DEFAULT_WHEA_MAX_EVENTS, GpuSource, HardwareHealthReport, InstalledProgram,
+    InstalledProgramsScan, OpenFilesScan, PortEntry, ProcessSample, ProgramAttribution,
+    ProgramRelationship, RollingHistory, ShortLivedWatcher, Store, SystemMetrics, ThrottleHistory,
+    attribute_processes, build_tree, check_hardware_health, list_installed_programs,
+    list_open_files, list_open_files_many, listening_ports_for, merge_recent_exits,
+    process_attention_reasons, program_relationships,
 };
 use sampling::{BackgroundSampler, IntervalChoice, Tick};
 use tray::{Tray, TrayAction};
@@ -39,6 +41,11 @@ const SPARK_POINTS: usize = 30;
 /// one point per minute and their verdicts need half an hour of history
 /// before they fire at all, so anything faster is wasted work.
 const TRENDS_INTERVAL: Duration = Duration::from_secs(30);
+/// Program ownership walks executable paths and parent chains. It is cheap
+/// after matcher preprocessing, but does not need the one-second precision
+/// of CPU sampling; keeping it slower matters on machines with thousands of
+/// processes and hundreds of uninstall entries.
+const PROGRAM_ACTIVITY_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortMetric {
@@ -133,6 +140,7 @@ enum ViewMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Processes,
+    Programs,
     Suspects,
     Analyze,
     Sensors,
@@ -147,8 +155,9 @@ impl Tab {
     /// Strip order, left to right: the live table first, then the views
     /// that explain why it looks the way it does, then the tools, then
     /// settings.
-    const ALL: [Tab; 9] = [
+    const ALL: [Tab; 10] = [
         Tab::Processes,
+        Tab::Programs,
         Tab::Suspects,
         Tab::Analyze,
         Tab::Sensors,
@@ -164,6 +173,7 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Processes => "processes",
+            Tab::Programs => "programs",
             Tab::Suspects => "suspects",
             Tab::Analyze => "analyze",
             Tab::Sensors => "sensors",
@@ -178,6 +188,9 @@ impl Tab {
     fn hover(self) -> &'static str {
         match self {
             Tab::Processes => "live process table",
+            Tab::Programs => {
+                "installed software, live resource use, launched children, and removal review"
+            }
             Tab::Suspects => {
                 "processes with a possible handle/memory leak or sustained background CPU"
             }
@@ -353,6 +366,15 @@ enum AnalyzeLine {
 struct AnalyzeState {
     /// Why the agent can't run, or what it will run as.
     availability: std::result::Result<String, String>,
+    /// The key, once a Windows Hello gesture has released it this session.
+    ///
+    /// Held in memory rather than re-prompting per question: the key is
+    /// resolved on every turn, and a gesture per question would make the tab
+    /// unusable. The gesture still gates the *process* getting the key at
+    /// all, and it is gone when rMon exits.
+    unlocked: Option<String>,
+    /// `Some` while a gesture is pending on a worker thread.
+    unlock_rx: Option<mpsc::Receiver<std::result::Result<String, String>>>,
     input: String,
     lines: Vec<AnalyzeLine>,
     /// `Some` while a turn is in flight.
@@ -370,7 +392,9 @@ enum AgentUpdate {
 impl AnalyzeState {
     fn new() -> Self {
         Self {
-            availability: AgentConfig::describe_availability(),
+            availability: AgentConfig::describe_availability(None),
+            unlocked: None,
+            unlock_rx: None,
             input: String::new(),
             lines: Vec::new(),
             rx: None,
@@ -385,7 +409,48 @@ impl AnalyzeState {
     /// Re-reads the configuration after the user changed it, so a saved key
     /// takes effect without restarting rMon.
     fn refresh_availability(&mut self) {
-        self.availability = AgentConfig::describe_availability();
+        self.availability = AgentConfig::describe_availability(self.unlocked.as_deref());
+    }
+
+    /// Asks for a Windows Hello gesture on a worker thread.
+    ///
+    /// The prompt blocks until the user responds, so it cannot run on the UI
+    /// thread — that would freeze the window, including the sampling tick.
+    fn start_unlock(&mut self) {
+        if self.unlock_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.unlock_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = rmon_core::config::load()
+                .map_err(|e| format!("{e:#}"))
+                .and_then(|s| s.llm.unlock_with_hello().map_err(|e| format!("{e:#}")));
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Whether a gesture is pending.
+    fn unlocking(&self) -> bool {
+        self.unlock_rx.is_some()
+    }
+
+    /// Collects a finished gesture.
+    fn poll_unlock(&mut self) {
+        let Some(rx) = &self.unlock_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(key)) => {
+                self.unlocked = Some(key);
+                self.unlock_rx = None;
+                self.refresh_availability();
+            }
+            Ok(Err(e)) => {
+                self.lines.push(AnalyzeLine::Error(e));
+                self.unlock_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.unlock_rx = None,
+        }
     }
 
     fn poll(&mut self) {
@@ -428,6 +493,123 @@ impl AnalyzeState {
                 }
             }
         }
+    }
+}
+
+struct ProgramListRow {
+    id: String,
+    name: String,
+    version: Option<String>,
+    active: bool,
+    observed: bool,
+    process_count: usize,
+    cpu_percent: f32,
+}
+
+/// Installed-program inventory is loaded only when its tab is first opened.
+/// Registry reads are usually fast, but keeping even that work off the UI
+/// thread preserves the same no-blocking rule as health/file scans.
+struct ProgramsState {
+    scan: Option<InstalledProgramsScan>,
+    rx: Option<mpsc::Receiver<InstalledProgramsScan>>,
+    attribution: ProgramAttribution,
+    activity_at: Option<Instant>,
+    relationships: Vec<ProgramRelationship>,
+    /// Programs for which a directly owned process or launched descendant
+    /// has been observed since this inventory was loaded. This is explicitly
+    /// session evidence, not a Windows-wide "last used" timestamp.
+    observed_ids: HashSet<String>,
+    selected_id: Option<String>,
+    filter: String,
+    active_only: bool,
+    review_only: bool,
+    include_system: bool,
+}
+
+impl ProgramsState {
+    fn new() -> Self {
+        Self {
+            scan: None,
+            rx: None,
+            attribution: ProgramAttribution::default(),
+            activity_at: None,
+            relationships: Vec::new(),
+            observed_ids: HashSet::new(),
+            selected_id: None,
+            filter: String::new(),
+            active_only: false,
+            review_only: false,
+            include_system: false,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.scan.is_some() || self.rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(list_installed_programs());
+        });
+    }
+
+    /// Returns true when a newly completed inventory needs attribution
+    /// against the latest process sample.
+    fn poll(&mut self) -> bool {
+        let Some(rx) = &self.rx else { return false };
+        match rx.try_recv() {
+            Ok(scan) => {
+                self.relationships = program_relationships(&scan.programs);
+                self.activity_at = None;
+                if self.selected_id.is_none() {
+                    self.selected_id = scan
+                        .programs
+                        .iter()
+                        .find(|program| !program.system_component && !program.update_or_hotfix)
+                        .or_else(|| scan.programs.first())
+                        .map(|program| program.id.clone());
+                }
+                self.scan = Some(scan);
+                self.rx = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                false
+            }
+        }
+    }
+
+    fn scanning(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    fn refresh_activity(&mut self, processes: &[ProcessSample]) {
+        let Some(scan) = &self.scan else { return };
+        if self
+            .activity_at
+            .is_some_and(|at| at.elapsed() < PROGRAM_ACTIVITY_INTERVAL)
+        {
+            return;
+        }
+        self.attribution = attribute_processes(&scan.programs, processes);
+        self.activity_at = Some(Instant::now());
+        self.observed_ids.extend(
+            self.attribution
+                .activities
+                .iter()
+                .filter(|activity| activity.active())
+                .map(|activity| activity.program_id.clone()),
+        );
+    }
+
+    fn activity(&self, id: &str) -> Option<&rmon_core::ProgramActivity> {
+        self.attribution
+            .activities
+            .iter()
+            .find(|activity| activity.program_id == id)
     }
 }
 
@@ -493,6 +675,7 @@ struct RmonApp {
     tab: Tab,
     analyze: AnalyzeState,
     search: SearchState,
+    programs: ProgramsState,
     /// Per-process trend analysis (leak suspects, idle burners), sorted
     /// most-interesting first. Recomputed on [`TRENDS_INTERVAL`], not every
     /// tick: it walks every pid's whole bucketed history, and the series it
@@ -538,6 +721,8 @@ impl RmonApp {
                 None
             }
         };
+        let mut programs = ProgramsState::new();
+        programs.start();
         Self {
             sampler,
             history: RollingHistory::new(RETAIN),
@@ -572,6 +757,7 @@ impl RmonApp {
             about_open: false,
             analyze: AnalyzeState::new(),
             search: SearchState::new(),
+            programs,
             trends: Vec::new(),
             trends_at: None,
             health: None,
@@ -628,6 +814,7 @@ impl RmonApp {
             }
         }
 
+        self.programs.refresh_activity(&snapshot.processes);
         self.history.push(snapshot);
         if self
             .trends_at
@@ -854,6 +1041,9 @@ impl RmonApp {
                 DEFAULT_WHEA_MAX_EVENTS,
             ));
         }
+        if tab == Tab::Programs {
+            self.programs.start();
+        }
     }
 
     /// Builds the same clipboard-ready process summary used by both the
@@ -869,6 +1059,7 @@ impl RmonApp {
             "Process: {} (PID {})\n\
              Parent PID: {}{}\n\
              Owner: {}\n\
+             Executable: {}\n\
              Command line: {}\n\
              CPU: {:.1}% instant, {} accumulated (over {})\n\
              GPU: {:.1}% instant, {} accumulated  [source: {}]\n\
@@ -885,6 +1076,7 @@ impl RmonApp {
                 ""
             },
             p.user.as_deref().unwrap_or("unknown"),
+            p.executable_path.as_deref().unwrap_or("unknown"),
             p.command_line.as_deref().unwrap_or("unknown"),
             p.cpu_percent,
             format_core_time(cpu_accum),
@@ -914,8 +1106,72 @@ fn gpu_source_label(src: GpuSource) -> &'static str {
     }
 }
 
+fn detail_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.weak(format!("{label}:"));
+        ui.label(value.unwrap_or("not recorded"));
+    });
+}
+
+fn program_removal_blockers(
+    program: &InstalledProgram,
+    relationships: &[ProgramRelationship],
+    activity: Option<&rmon_core::ProgramActivity>,
+    observed_this_session: bool,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if activity.is_some_and(rmon_core::ProgramActivity::active) {
+        blockers.push("the program or a descendant it launched is running now".to_string());
+    } else if observed_this_session {
+        blockers.push("it was observed running earlier in this rMon session".to_string());
+    }
+    if relationships
+        .iter()
+        .any(|relationship| relationship.parent_id == program.id)
+    {
+        blockers.push("Windows records one or more dependent uninstall entries".to_string());
+    }
+    if program.system_component {
+        blockers.push("the installer marks it as a system component".to_string());
+    }
+    if program.update_or_hotfix {
+        blockers.push("the entry is an update or hotfix".to_string());
+    }
+    if !program.has_uninstaller() {
+        blockers.push("no enabled uninstall command is registered".to_string());
+    }
+    blockers
+}
+
+fn program_relationship_names(
+    program: &InstalledProgram,
+    programs: &[InstalledProgram],
+    relationships: &[ProgramRelationship],
+) -> (Option<String>, Vec<String>) {
+    let name_for = |id: &str| {
+        programs
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .map(|candidate| candidate.name.clone())
+    };
+    let parent = relationships
+        .iter()
+        .find(|relationship| relationship.dependent_id == program.id)
+        .and_then(|relationship| name_for(&relationship.parent_id));
+    let dependents = relationships
+        .iter()
+        .filter(|relationship| relationship.parent_id == program.id)
+        .filter_map(|relationship| name_for(&relationship.dependent_id))
+        .collect();
+    (parent, dependents)
+}
+
 impl eframe::App for RmonApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Proof of life for the sampling thread. Without it, a window that
+        // stops being drawn — minimized, most obviously — would have rMon
+        // sampling forever into a channel nobody reads.
+        self.sampler.mark_alive();
         if let Some(tick) = self.sampler.newest() {
             self.tick(tick);
         }
@@ -924,20 +1180,30 @@ impl eframe::App for RmonApp {
         }
         self.search.poll();
         self.analyze.poll();
+        self.analyze.poll_unlock();
         self.credentials.poll();
+        if self.credentials.poll_save() {
+            self.analyze.refresh_availability();
+        }
         if let Some(h) = self.health.as_mut() {
             h.poll();
+        }
+        if self.programs.poll() {
+            let processes = self
+                .history
+                .latest()
+                .map(|snapshot| snapshot.processes.clone())
+                .unwrap_or_default();
+            self.programs.refresh_activity(&processes);
         }
 
         about::window(ui.ctx(), &mut self.about_open);
 
         // A window nobody can see does not need the same attention as one
-        // being watched. Minimized counts: the taskbar preview is stale by
-        // design, and hiding to the tray goes through the same flag.
-        let visible = ui.input(|i| {
-            let vp = i.viewport();
-            !vp.minimized.unwrap_or(false)
-        }) && !self.hidden_to_tray;
+        // being watched. This covers hiding to the tray, where egui keeps
+        // drawing an invisible window; a minimized one stops being drawn
+        // altogether and is handled by `mark_alive` above.
+        let visible = !self.hidden_to_tray;
         if visible != self.window_visible {
             self.window_visible = visible;
             self.sampler.set_hidden(!visible);
@@ -956,8 +1222,10 @@ impl eframe::App for RmonApp {
             || self.search.scanning()
             || self.analyze.running()
             || self.credentials.fetching()
+            || self.analyze.unlocking()
             || self.hwinfo_sensor_rx.is_some()
-            || self.health.as_ref().is_some_and(HealthState::scanning);
+            || self.health.as_ref().is_some_and(HealthState::scanning)
+            || self.programs.scanning();
         let repaint_interval = if animating {
             Duration::from_millis(200)
         } else {
@@ -1119,6 +1387,7 @@ impl eframe::App for RmonApp {
             .min_size(200.0)
             .show(ui, |ui| match self.tab {
                 Tab::Processes => self.draw_table(ui),
+                Tab::Programs => self.draw_programs(ui),
                 Tab::Suspects => self.draw_suspects(ui),
                 Tab::Analyze => self.draw_analyze(ui),
                 Tab::Sensors => self.draw_hardware(ui),
@@ -1134,11 +1403,19 @@ impl eframe::App for RmonApp {
             .default_size(column_width)
             .min_size(200.0)
             .show(ui, |ui| {
-                self.draw_detail_info(ui);
+                if self.tab == Tab::Programs {
+                    self.draw_program_detail(ui);
+                } else {
+                    self.draw_detail_info(ui);
+                }
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.draw_detail_graph(ui);
+            if self.tab == Tab::Programs {
+                self.draw_program_processes(ui);
+            } else {
+                self.draw_detail_graph(ui);
+            }
         });
     }
 }
@@ -1170,6 +1447,452 @@ impl RmonApp {
         });
     }
 
+    fn draw_programs(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Installed programs");
+        ui.weak("Win32/MSI inventory · live process attribution");
+        ui.add_space(6.0);
+
+        if self.programs.scan.is_none() {
+            if self.programs.scanning() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("reading Windows uninstall registry…");
+                });
+            } else if ui.button("scan installed programs").clicked() {
+                self.programs.start();
+            }
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("search:");
+            ui.text_edit_singleline(&mut self.programs.filter);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.programs.active_only, "active now");
+            ui.checkbox(&mut self.programs.review_only, "removal review");
+            ui.checkbox(
+                &mut self.programs.include_system,
+                "include system components/updates",
+            );
+            if ui.button("↻ rescan").clicked() {
+                self.programs.scan = None;
+                self.programs.selected_id = None;
+                self.programs.start();
+            }
+        });
+        ui.add_space(4.0);
+
+        let filter = self.programs.filter.to_ascii_lowercase();
+        let Some(scan) = &self.programs.scan else {
+            return;
+        };
+        let mut visible: Vec<ProgramListRow> = scan
+            .programs
+            .iter()
+            .filter(|program| {
+                self.programs.include_system
+                    || (!program.system_component && !program.update_or_hotfix)
+            })
+            .filter(|program| {
+                filter.is_empty()
+                    || program.name.to_ascii_lowercase().contains(&filter)
+                    || program
+                        .publisher
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&filter))
+                    || program
+                        .version
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&filter))
+                    || program
+                        .install_location
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&filter))
+            })
+            .filter_map(|program| {
+                let activity = self.programs.activity(&program.id);
+                let active = activity.is_some_and(rmon_core::ProgramActivity::active);
+                let observed = self.programs.observed_ids.contains(&program.id);
+                let reviewable = program_removal_blockers(
+                    program,
+                    &self.programs.relationships,
+                    activity,
+                    observed,
+                )
+                .is_empty();
+                if (self.programs.active_only && !active)
+                    || (self.programs.review_only && !reviewable)
+                {
+                    return None;
+                }
+                Some(ProgramListRow {
+                    id: program.id.clone(),
+                    name: program.name.clone(),
+                    version: program.version.clone(),
+                    active,
+                    observed,
+                    process_count: activity.map_or(0, rmon_core::ProgramActivity::process_count),
+                    cpu_percent: activity.map_or(0.0, |activity| activity.cpu_percent),
+                })
+            })
+            .collect();
+        visible.sort_by(|a, b| {
+            b.active.cmp(&a.active).then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+        });
+
+        ui.label(format!(
+            "{} shown · {} inventory entries",
+            visible.len(),
+            scan.programs.len()
+        ));
+        ui.weak("active totals include child processes launched by the app");
+        let mut selected = None;
+        egui::ScrollArea::vertical()
+            .id_salt("installed-program-list")
+            .show(ui, |ui| {
+                for row in &visible {
+                    let status = if row.active {
+                        format!("● {} proc · {:.1}% CPU", row.process_count, row.cpu_percent)
+                    } else if row.observed {
+                        "seen this session".to_string()
+                    } else {
+                        "not observed this session".to_string()
+                    };
+                    let text = format!(
+                        "{}{}\n  {status}",
+                        row.name,
+                        row.version
+                            .as_deref()
+                            .map(|version| format!("  {version}"))
+                            .unwrap_or_default(),
+                    );
+                    let response = ui.selectable_label(
+                        self.programs.selected_id.as_deref() == Some(row.id.as_str()),
+                        text,
+                    );
+                    if row.active {
+                        let dot = egui::Rect::from_center_size(
+                            response.rect.left_center() + egui::vec2(4.0, 0.0),
+                            egui::vec2(4.0, 4.0),
+                        );
+                        ui.painter().rect_filled(dot, 2.0, OK_COLOR);
+                    }
+                    if response.clicked() {
+                        selected = Some(row.id.clone());
+                    }
+                }
+            });
+        if let Some(id) = selected {
+            self.programs.selected_id = Some(id);
+        }
+
+        if !scan.warnings.is_empty() {
+            ui.collapsing(
+                format!("{} inventory warning(s)", scan.warnings.len()),
+                |ui| {
+                    for warning in &scan.warnings {
+                        ui.weak(warning);
+                    }
+                },
+            );
+        }
+    }
+
+    fn draw_program_detail(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(ui.available_width());
+        let Some(id) = self.programs.selected_id.as_deref() else {
+            ui.label("Select an installed program.");
+            return;
+        };
+        let Some(program) = self
+            .programs
+            .scan
+            .as_ref()
+            .and_then(|scan| scan.programs.iter().find(|program| program.id == id))
+            .cloned()
+        else {
+            ui.label("The selected program is no longer in the inventory.");
+            return;
+        };
+        let activity = self.programs.activity(&program.id).cloned();
+        let observed = self.programs.observed_ids.contains(&program.id);
+        let blockers = program_removal_blockers(
+            &program,
+            &self.programs.relationships,
+            activity.as_ref(),
+            observed,
+        );
+
+        ui.heading(&program.name);
+        if let Some(version) = &program.version {
+            ui.label(format!("version {version}"));
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.analyze.running(),
+                    egui::Button::new("✨ explain purpose & assess"),
+                )
+                .on_hover_text(
+                    "Ask the configured analysis model to explain identity, purpose, evidence, and removal risk",
+                )
+                .clicked()
+            {
+                self.ask_program_diagnosis(&program);
+            }
+            if self.analyze.running() {
+                ui.spinner();
+                ui.weak("analysis already running");
+            }
+        });
+        ui.add_space(6.0);
+
+        detail_field(ui, "publisher", program.publisher.as_deref());
+        detail_field(ui, "install location", program.install_location.as_deref());
+        detail_field(ui, "installed", program.install_date.as_deref());
+        detail_field(ui, "scope", Some(program.scope.as_str()));
+        if let Some(size) = program.estimated_size_bytes {
+            detail_field(ui, "estimated size", Some(&format_bytes(size)));
+        }
+        if let Some(comments) = &program.comments {
+            ui.add_space(4.0);
+            ui.label(comments);
+        }
+        if let Some(website) = &program.website {
+            ui.hyperlink_to("publisher website", website);
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Use observed by rMon").strong());
+        match activity.as_ref() {
+            Some(activity) if activity.active() => {
+                ui.colored_label(
+                    OK_COLOR,
+                    format!(
+                        "active now · {} process(es) · {:.1}% CPU · {:.1}% GPU · {} memory",
+                        activity.process_count(),
+                        activity.cpu_percent,
+                        activity.gpu_percent,
+                        format_bytes(activity.memory_bytes),
+                    ),
+                );
+                ui.weak("inclusive of descendants launched by this program");
+            }
+            _ if observed => {
+                ui.label("not active now; a process was observed earlier in this rMon session");
+            }
+            _ => {
+                ui.label("not observed during this rMon session");
+                ui.weak("this is not a system-wide last-used timestamp and does not mean unused");
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Known relationships").strong());
+        let (parent, dependents) = program_relationship_names(
+            &program,
+            self.programs
+                .scan
+                .as_ref()
+                .map(|scan| scan.programs.as_slice())
+                .unwrap_or_default(),
+            &self.programs.relationships,
+        );
+        if let Some(parent) = parent {
+            ui.label(format!("installer parent: {parent}"));
+        }
+        for dependent in &dependents {
+            ui.label(format!("dependent uninstall entry: {dependent}"));
+        }
+        if program.parent_key_name.is_none() && dependents.is_empty() {
+            ui.weak("no installer relationship recorded");
+        }
+        ui.weak(
+            "Windows records only some update/bundle relationships here; this is not a complete dependency graph.",
+        );
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Suspicion / verification").strong());
+        let attention = program.attention_reasons();
+        if attention.is_empty() {
+            ui.label("no obvious warning in installer metadata or install path");
+        } else {
+            for reason in attention {
+                ui.colored_label(WARN_COLOR, format!("⚠ {reason}"));
+            }
+        }
+        ui.weak("This is triage, not an antivirus scan or a digital-signature verdict.");
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Removal review").strong());
+        if blockers.is_empty() {
+            ui.colored_label(WARN_COLOR, "candidate to review — no current blocker found");
+            ui.label(
+                "It is idle in the observed session, has an uninstaller, and no dependent entry is known.",
+            );
+        } else {
+            for blocker in blockers {
+                ui.label(format!("• {blocker}"));
+            }
+        }
+        ui.weak(
+            "Never read ‘candidate’ as ‘safe’: confirm project/config usage and backups first. rMon does not uninstall software.",
+        );
+    }
+
+    fn draw_program_processes(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(ui.available_width());
+        ui.heading("Live process provenance");
+        let Some(id) = self.programs.selected_id.as_deref() else {
+            ui.label("Select an installed program.");
+            return;
+        };
+        let Some(program) = self
+            .programs
+            .scan
+            .as_ref()
+            .and_then(|scan| scan.programs.iter().find(|program| program.id == id))
+        else {
+            return;
+        };
+        let Some(activity) = self.programs.activity(id) else {
+            ui.label("Waiting for a process sample…");
+            return;
+        };
+        let pids = activity.all_pids();
+        if pids.is_empty() {
+            ui.label("No process from this program is active now.");
+            ui.weak(
+                "When it runs, this panel shows its executable plus descendants it launched — for example Warp → find.exe.",
+            );
+            return;
+        }
+
+        ui.label(format!(
+            "{} process(es), inclusive {:.1}% CPU · {:.1}% GPU · {} memory",
+            pids.len(),
+            activity.cpu_percent,
+            activity.gpu_percent,
+            format_bytes(activity.memory_bytes),
+        ));
+        ui.weak("inclusive totals can overlap a child that belongs to another installed program");
+        ui.add_space(6.0);
+
+        let Some(snapshot) = self.history.latest() else {
+            return;
+        };
+        let processes: Vec<_> = snapshot
+            .processes
+            .iter()
+            .filter(|process| pids.contains(&process.pid))
+            .cloned()
+            .collect();
+        let rows = build_tree(
+            &processes,
+            |process| process.cpu_percent + process.gpu_percent,
+            false,
+        );
+        let program_names: HashMap<_, _> = self
+            .programs
+            .scan
+            .as_ref()
+            .into_iter()
+            .flat_map(|scan| &scan.programs)
+            .map(|program| (program.id.as_str(), program.name.as_str()))
+            .collect();
+        let links: HashMap<_, _> = self
+            .programs
+            .attribution
+            .links
+            .iter()
+            .map(|link| (link.pid, link))
+            .collect();
+        let mut selected_pid = None;
+        egui::ScrollArea::vertical()
+            .id_salt("program-process-tree")
+            .show(ui, |ui| {
+                for (depth, process) in &rows {
+                    let link = links.get(&process.pid).copied();
+                    let direct_name = link
+                        .and_then(|link| link.direct_program_id.as_deref())
+                        .and_then(|id| program_names.get(id).copied());
+                    let relation = if direct_name == Some(program.name.as_str()) {
+                        "program executable".to_string()
+                    } else if let Some(owner) = direct_name {
+                        format!("{owner}; launched by {}", program.name)
+                    } else {
+                        format!("launched by {}", program.name)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add_space(*depth as f32 * 16.0);
+                        if ui
+                            .selectable_label(
+                                self.selected_pid == Some(process.pid),
+                                format!("{} ({})", process.name, process.pid),
+                            )
+                            .clicked()
+                        {
+                            selected_pid = Some(process.pid);
+                        }
+                        ui.weak(format!(
+                            "{:.1}% CPU · {:.1}% GPU · {relation}",
+                            process.cpu_percent, process.gpu_percent
+                        ));
+                    });
+                    if let Some(path) = &process.executable_path {
+                        ui.horizontal(|ui| {
+                            ui.add_space((*depth as f32 + 1.0) * 16.0);
+                            ui.label(egui::RichText::new(path).small().monospace().weak());
+                        });
+                    }
+                    for reason in process_attention_reasons(process) {
+                        ui.horizontal(|ui| {
+                            ui.add_space((*depth as f32 + 1.0) * 16.0);
+                            ui.colored_label(WARN_COLOR, format!("⚠ {reason}"));
+                        });
+                    }
+                }
+            });
+        if let Some(pid) = selected_pid {
+            self.selected_pid = Some(pid);
+        }
+    }
+
+    fn ask_process_diagnosis(&mut self, pid: u32, name: &str) {
+        self.analyze.input = format!(
+            "Explain and assess process {name:?} (PID {pid}). Use process_detail and, when it maps \
+             to installed software, program_detail. Tell me its normal purpose, executable identity, \
+             who launched it and what it launched, why it may be using resources, concrete suspicious \
+             indicators versus missing evidence, and read-only verification steps. Do not label it \
+             malware or safe from the filename alone."
+        );
+        self.tab = Tab::Analyze;
+        self.start_analysis();
+    }
+
+    fn ask_program_diagnosis(&mut self, program: &InstalledProgram) {
+        self.analyze.input = format!(
+            "Explain and assess the installed program {:?} (inventory id {:?}). Use program_detail. \
+             Tell me what it is normally used for, what rMon actually observes it doing now, which \
+             parent/child processes and known dependents it has, any concrete suspicious indicators \
+             versus merely missing evidence, read-only verification commands, and whether it is only \
+             a candidate to review for uninstall. Do not call it safe to uninstall when usage or \
+             dependencies are unknown.",
+            program.name, program.id
+        );
+        self.tab = Tab::Analyze;
+        self.start_analysis();
+    }
+
     /// Asks an LLM to explain the current machine state, using rMon's own
     /// telemetry as its evidence.
     ///
@@ -1187,6 +1910,40 @@ impl RmonApp {
                 let why = why.clone();
                 ui.colored_label(WARN_COLOR, why);
                 ui.add_space(6.0);
+
+                // A key held behind Windows Hello is configured, not missing.
+                // Offering the editor first would invite someone to re-enter
+                // a key they already have, when all that is needed is a
+                // gesture.
+                if self.credentials.requires_hello() {
+                    ui.horizontal(|ui| {
+                        let pending = self.analyze.unlocking();
+                        if ui
+                            .add_enabled(
+                                !pending,
+                                egui::Button::new("🔓 Unlock with Windows Hello"),
+                            )
+                            .on_hover_text(
+                                "Releases the key for this session only.                                  rMon forgets it when it exits.",
+                            )
+                            .clicked()
+                        {
+                            self.analyze.start_unlock();
+                        }
+                        if pending {
+                            ui.spinner();
+                            ui.weak("waiting for your gesture…");
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.collapsing("Change credentials", |ui| {
+                        if self.credentials.draw(ui) {
+                            self.analyze.refresh_availability();
+                        }
+                    });
+                    return;
+                }
+
                 // The editor is drawn here, not merely pointed at, because
                 // this is where someone discovers the tab is unconfigured.
                 ui.group(|ui| {
@@ -1332,9 +2089,15 @@ impl RmonApp {
                 observed_secs: self.throttle.observed().as_secs(),
                 fraction_limited: self.throttle.fraction_limited(),
             },
+            installed_programs: self
+                .programs
+                .scan
+                .as_ref()
+                .map(|scan| scan.programs.clone())
+                .unwrap_or_default(),
         };
 
-        let config = match AgentConfig::resolve() {
+        let config = match AgentConfig::resolve(self.analyze.unlocked.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 self.analyze
@@ -1813,6 +2576,7 @@ impl RmonApp {
         enum ProcessContextAction {
             OpenFiles(u32),
             CopyInfo(u32),
+            Explain(u32),
             Kill(u32),
         }
         let mut header_click = None;
@@ -1991,6 +2755,13 @@ impl RmonApp {
                             context_action = Some(ProcessContextAction::CopyInfo(p.pid));
                             ui.close();
                         }
+                        if ui
+                            .add_enabled(is_live, egui::Button::new("✨ Explain / assess"))
+                            .clicked()
+                        {
+                            context_action = Some(ProcessContextAction::Explain(p.pid));
+                            ui.close();
+                        }
                         ui.separator();
                         if ui
                             .add_enabled(
@@ -2045,6 +2816,16 @@ impl RmonApp {
                         ui.ctx().copy_text(text);
                     }
                 }
+                ProcessContextAction::Explain(pid) => {
+                    self.selected_pid = Some(pid);
+                    let name = self
+                        .rows
+                        .iter()
+                        .find(|(_, process)| process.pid == pid)
+                        .map(|(_, process)| process.name.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    self.ask_process_diagnosis(pid, &name);
+                }
                 ProcessContextAction::Kill(pid) => {
                     self.selected_pid = Some(pid);
                     match rmon_core::kill_process(pid) {
@@ -2087,6 +2868,15 @@ impl RmonApp {
                 && let Some(text) = self.copy_info_text(pid)
             {
                 ui.ctx().copy_text(text);
+            }
+            if ui
+                .add_enabled(
+                    !self.analyze.running(),
+                    egui::Button::new("✨ explain / assess"),
+                )
+                .clicked()
+            {
+                self.ask_process_diagnosis(pid, &name);
             }
             if ui
                 .add(egui::Button::new(
@@ -2144,9 +2934,49 @@ impl RmonApp {
                     .unwrap_or_else(|| "—".to_string()),
             );
         });
+        if let Some(link) = self
+            .programs
+            .attribution
+            .links
+            .iter()
+            .find(|link| link.pid == pid)
+        {
+            let name_for = |id: &str| {
+                self.programs
+                    .scan
+                    .as_ref()
+                    .and_then(|scan| scan.programs.iter().find(|program| program.id == id))
+                    .map(|program| program.name.as_str())
+            };
+            if let Some(program) = link.direct_program_id.as_deref().and_then(name_for) {
+                ui.label(format!("installed program: {program}"));
+            } else {
+                ui.weak("installed program: not attributed by executable path");
+            }
+            if let Some(launcher) = link.launcher_program_id.as_deref().and_then(name_for) {
+                ui.label(format!("launched under: {launcher}"));
+            }
+        }
+        if let Some(path) = proc_info
+            .as_ref()
+            .and_then(|process| process.executable_path.as_deref())
+        {
+            ui.weak("executable:");
+            ui.label(egui::RichText::new(path).monospace().small());
+        }
         if let Some(cmd) = proc_info.as_ref().and_then(|p| p.command_line.clone()) {
             ui.weak("command line:");
             ui.label(egui::RichText::new(cmd).monospace().small());
+        }
+        if let Some(process) = &proc_info {
+            let reasons = process_attention_reasons(process);
+            if reasons.is_empty() {
+                ui.weak("no obvious path-based warning (not a security verification)");
+            } else {
+                for reason in reasons {
+                    ui.colored_label(WARN_COLOR, format!("⚠ {reason}"));
+                }
+            }
         }
         ui.add_space(4.0);
         ui.separator();

@@ -28,6 +28,22 @@
 //! most [`MAX_DUTY`] of one core on sampling whatever it is running on.
 //! Ordinary machines (a sample costs a few ms) are unaffected and keep
 //! ticking at [`MIN_INTERVAL`]; pathological ones back off on their own.
+//!
+//! # Why it stops
+//!
+//! A thread on its own timer would keep sampling after the UI stopped
+//! looking, which is not hypothetical: eframe stops calling `App::ui`
+//! altogether while the window is minimized. Samples would pile up in the
+//! channel — a snapshot of every process on the machine, once per
+//! interval, for as long as the window stayed down — and every one of
+//! them would have been paid for and then thrown away, because the history
+//! they feed lives on the UI thread.
+//!
+//! So the UI has to prove it is still drawing
+//! ([`BackgroundSampler::mark_alive`]) before each sample is taken. No
+//! frames, no sampling, nothing queued. Hiding to the tray is the one case
+//! where frames keep coming for a window nobody can see, and that gets
+//! [`HIDDEN_INTERVAL`] instead.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,14 +61,14 @@ pub const MAX_INTERVAL: Duration = Duration::from_secs(10);
 /// Share of one core rMon budgets for sampling before it starts sampling
 /// less often. 5% is low enough not to show up in its own process list.
 pub const MAX_DUTY: f64 = 0.05;
-/// Interval used while the window is hidden or minimized.
+/// Interval used while the window is hidden to the tray.
 ///
-/// Not "paused": the accumulated-usage ranking and the leak/idle trends
-/// are the reason people leave rMon in the tray, and both integrate
-/// `cpu_percent` over elapsed time, so a slower cadence still totals
-/// correctly — a percentage measured over 10s *is* the average over those
-/// 10s. 10s specifically because `RollingHistory` clamps a single tick's
-/// contribution at 10s, so anything longer would silently under-count.
+/// Slower rather than stopped, because the accumulated-usage ranking and
+/// the leak/idle trends are the reason people leave rMon in the tray, and
+/// both integrate `cpu_percent` over elapsed time: a percentage measured
+/// over 10s *is* the average over those 10s, so the totals stay right. 10s
+/// specifically because `RollingHistory` caps a single tick's contribution
+/// at 10s, so a slower cadence would silently under-count.
 pub const HIDDEN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long the thread naps before re-reading the shared knobs, so a
@@ -118,6 +134,9 @@ pub struct BackgroundSampler {
     /// 0 means automatic; see [`IntervalChoice`].
     override_ms: Arc<AtomicU64>,
     hidden: Arc<AtomicBool>,
+    /// Set by the UI thread every frame, cleared by the sampling thread
+    /// when it checks. See [`BackgroundSampler::mark_alive`].
+    alive: Arc<AtomicBool>,
     has_gpu_source: bool,
     /// Cost and interval of the most recent tick, for the settings tab.
     last_cost: Option<Duration>,
@@ -131,14 +150,18 @@ impl BackgroundSampler {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
-        let override_ms = Arc::new(AtomicU64::new(0));
-        let hidden = Arc::new(AtomicBool::new(false));
+        let shared = Shared {
+            override_ms: Arc::new(AtomicU64::new(0)),
+            hidden: Arc::new(AtomicBool::new(false)),
+            // Starts true so the first sample is taken without waiting for
+            // a frame; the app has one on the way by construction.
+            alive: Arc::new(AtomicBool::new(true)),
+        };
 
-        let thread_override = Arc::clone(&override_ms);
-        let thread_hidden = Arc::clone(&hidden);
+        let thread_shared = shared.clone();
         std::thread::Builder::new()
             .name("rmon-sampler".to_string())
-            .spawn(move || run(tx, init_tx, thread_override, thread_hidden))
+            .spawn(move || run(tx, init_tx, thread_shared))
             .expect("failed to spawn the sampling thread");
 
         // If the thread died during construction there is nothing to
@@ -146,12 +169,27 @@ impl BackgroundSampler {
         let has_gpu_source = init_rx.recv().unwrap_or(false);
         Self {
             rx,
-            override_ms,
-            hidden,
+            override_ms: shared.override_ms,
+            hidden: shared.hidden,
+            alive: shared.alive,
             has_gpu_source,
             last_cost: None,
             interval: MIN_INTERVAL,
         }
+    }
+
+    /// Tells the sampling thread the UI is still being drawn. Must be
+    /// called every frame.
+    ///
+    /// This is the backstop that keeps rMon from sampling into the void.
+    /// eframe stops calling `App::ui` entirely while the window is
+    /// minimized — verified, not assumed — so a sampling thread on its own
+    /// timer would keep paying for samples nobody folds into the history,
+    /// and queue every one of them in the channel until the window came
+    /// back. Requiring proof of life turns both problems into one rule:
+    /// no frames, no sampling.
+    pub fn mark_alive(&self) {
+        self.alive.store(true, Ordering::Relaxed);
     }
 
     /// The newest tick, if one has arrived since the last call. Older
@@ -203,40 +241,44 @@ pub fn auto_interval(cost: Duration) -> Duration {
     budgeted.clamp(MIN_INTERVAL, MAX_INTERVAL)
 }
 
-fn run(
-    tx: mpsc::Sender<Tick>,
-    init_tx: mpsc::Sender<bool>,
+/// The knobs the UI thread and the sampling thread share.
+#[derive(Clone)]
+struct Shared {
     override_ms: Arc<AtomicU64>,
     hidden: Arc<AtomicBool>,
-) {
+    alive: Arc<AtomicBool>,
+}
+
+fn run(tx: mpsc::Sender<Tick>, init_tx: mpsc::Sender<bool>, shared: Shared) {
     let mut sampler = Sampler::new();
     if init_tx.send(sampler.has_gpu_source()).is_err() {
         return;
     }
     sampler.sample(); // warm-up: CPU percentages are deltas, so discard it.
 
-    let mut was_hidden = false;
     let mut interval = MIN_INTERVAL;
+    let mut was_away = false;
     loop {
-        // Re-read the knobs in slices so a change lands within POLL_SLICE
-        // rather than at the end of the current wait.
+        // Wait out the interval in slices, so a change to the knobs lands
+        // within POLL_SLICE instead of at the end of a possibly-10s sleep.
         let deadline = Instant::now() + interval;
-        while Instant::now() < deadline {
-            std::thread::sleep(POLL_SLICE.min(deadline - Instant::now()));
-            if hidden.load(Ordering::Relaxed) != was_hidden {
-                break; // visibility flipped: re-evaluate the cadence now
-            }
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(POLL_SLICE.min(left));
         }
 
-        let now_hidden = hidden.load(Ordering::Relaxed);
-        if now_hidden != was_hidden {
-            was_hidden = now_hidden;
-            if !now_hidden {
-                // Coming back into view after a slow stretch: re-baseline
-                // so the first visible reading is a fresh delta rather
-                // than an average over however long the window was away.
-                sampler.sample();
-            }
+        // Then wait for the UI to prove it is still drawing frames. While
+        // it isn't, this loop costs one atomic read per POLL_SLICE and
+        // takes no samples at all.
+        while !shared.alive.swap(false, Ordering::Relaxed) {
+            was_away = true;
+            std::thread::sleep(POLL_SLICE);
+        }
+
+        if std::mem::take(&mut was_away) {
+            // The UI was gone long enough that the CPU-time baseline is
+            // stale. Re-baseline, so the first reading it gets back is a
+            // fresh delta rather than an average over the whole absence.
+            sampler.sample();
         }
 
         let started = Instant::now();
@@ -244,11 +286,11 @@ fn run(
         let ports = list_all_ports().unwrap_or_default();
         let cost = started.elapsed();
 
-        interval = match IntervalChoice::from_millis(override_ms.load(Ordering::Relaxed)) {
+        interval = match IntervalChoice::from_millis(shared.override_ms.load(Ordering::Relaxed)) {
             IntervalChoice::Auto => auto_interval(cost),
             IntervalChoice::Fixed(d) => d,
         };
-        if now_hidden {
+        if shared.hidden.load(Ordering::Relaxed) {
             interval = interval.max(HIDDEN_INTERVAL);
         }
 
@@ -287,6 +329,34 @@ mod tests {
         // Absurd costs are capped rather than extrapolated: a monitor that
         // updates once a minute has stopped being a monitor.
         assert_eq!(auto_interval(Duration::from_secs(5)), MAX_INTERVAL);
+    }
+
+    /// The backpressure rule end to end: a sampler whose UI never draws a
+    /// frame must take no samples and queue nothing, and must resume as
+    /// soon as frames come back.
+    #[test]
+    fn no_frames_means_no_samples() {
+        let mut sampler = BackgroundSampler::start();
+
+        // One sample is allowed through on the initial `alive` credit.
+        std::thread::sleep(MIN_INTERVAL + Duration::from_millis(500));
+        let first = sampler.newest();
+        assert!(first.is_some(), "the first sample should arrive on its own");
+
+        // Now go quiet: no mark_alive, so nothing more may be produced.
+        std::thread::sleep(MIN_INTERVAL * 3);
+        assert!(
+            sampler.newest().is_none(),
+            "a UI that stopped drawing must not keep the sampler running"
+        );
+
+        // And resume the moment the UI draws again.
+        sampler.mark_alive();
+        std::thread::sleep(MIN_INTERVAL + Duration::from_millis(1500));
+        assert!(
+            sampler.newest().is_some(),
+            "sampling should resume with the UI"
+        );
     }
 
     #[test]

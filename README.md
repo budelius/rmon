@@ -11,8 +11,9 @@ over time. Ships as three binaries sharing one core sampling/storage crate:
 
 ```
 crates/
-  rmon-core/  sampling (CPU + GPU), SQLite storage, rolling in-memory history
-  rmon-cli/   `rmon snapshot` / `rmon record`
+  rmon-core/  sampling, installed-program inventory/attribution, storage, history
+  rmon-agent/ read-only analysis agent and OpenAI-compatible transport
+  rmon-cli/   `rmon snapshot` / `rmon record` / `rmon programs`
   rmon-tui/   terminal dashboard
   rmon-gui/   desktop dashboard
 ```
@@ -46,6 +47,11 @@ cargo run -p rmon-cli -- ports 1234
 # Search open files and ports across every process at once
 cargo run -p rmon-cli -- search "chrome"
 
+# Installed Win32/MSI programs, live processes, and conservative removal review
+cargo run -p rmon-cli -- programs
+cargo run -p rmon-cli -- programs --filter warp --active
+cargo run -p rmon-cli -- programs --review
+
 # Hardware health: WHEA event log entries, BIOS version, CPU microcode revision
 cargo run -p rmon-cli -- health --days 7
 
@@ -66,8 +72,8 @@ ranked list and a parent/child process tree. Both also have a live
 substring search box and a header line with CPU/GPU temperature and
 throttle status (see below).
 
-The GUI's left column is a tab strip — **processes · suspects · analyze ·
-sensors · health · exited · search · what's new · settings** — so every view is one click from
+The GUI's left column is a tab strip — **processes · programs · suspects ·
+analyze · sensors · health · exited · search · what's new · settings** — so every view is one click from
 every other. (These were previously buried in the App menu, each opening a
 panel with its own "back" button, which meant the only route from one view
 to another ran through the process table.) The suspects tab shows its count
@@ -103,8 +109,41 @@ individually resizable by dragging their border. Clicking anywhere on a row
 selects it (not just the PID cell). `↑`/`↓`, Page Up/Down, Home/End, and the
 numeric keypad navigate the current row order once no text field has focus;
 left/right (keypad 4/6) collapse or expand tree rows. Right-clicking a row
-opens its context menu for open files, copy info, and kill. The redundant
+opens its context menu for open files, copy info, explain/assess, and kill. The redundant
 Process menu is gone.
+
+### Installed programs, provenance, and removal review
+
+The GUI's **programs** tab (and `rmon programs` in the CLI) reads the
+per-machine/per-user, 32/64-bit Windows Uninstall registry views used by
+classic Programs and Features. It shows publisher/version/location/size,
+then associates live processes by their full executable path. Parent chains
+are kept separately from package ownership, so a terminal such as Warp can
+show `warp.exe → find.exe` and include the child in its live CPU/GPU/memory
+total even though `find.exe` is a Windows executable rather than a Warp
+binary.
+
+The dependency view is deliberately honest about scope. Windows uninstall
+entries expose some explicit `ParentKeyName` update/bundle relationships,
+but there is no universal Windows package dependency graph for arbitrary
+Win32 software. rMon shows those known links and the observed process tree;
+it does not invent links from similar names. Portable executables and some
+Store packages may also be absent from this registry inventory.
+
+**Removal review** filters to entries that are not running/observed in this
+rMon session, have a registered uninstaller, are not marked as a system
+component/update, and have no known dependent uninstall entry. That means
+“candidate to investigate,” never “safe to uninstall”: session inactivity is
+not a reliable last-used timestamp, and unknown dependencies remain unknown.
+rMon never runs an uninstall command.
+
+Both process details and program details have **explain / assess** actions.
+The configured analysis model gets the executable path, publisher/install
+metadata, command line, parent/children, resource readings, and rMon's
+path-based warning signals. It is instructed to separate familiar-purpose
+knowledge from measured evidence, not call an unfamiliar/unsigned item
+malware merely from its name, offer read-only verification commands, and
+avoid declaring software safe to remove when usage/dependencies are unknown.
 
 ### Open files
 
@@ -235,6 +274,28 @@ pointing at the current executable with `--minimized` — no Administrator
 rights needed, and unchecking it fully reverses it. A `--minimized` launch
 starts with the window hidden, straight into the tray, so logging in
 doesn't pop a window up.
+
+### What rMon costs to run (GUI)
+
+Sampling happens on its own thread, and how often it happens depends on
+what a sample costs on your machine. Most of a sample is one
+`NtQuerySystemInformation` call that returns every process *and every
+thread* on the system, so the price is set by how loaded the box is: a few
+milliseconds on an ordinary desktop, but 85-100ms on one carrying 1,350
+processes and 25,000 threads. rMon measures each sample and spaces out the
+next one to keep its own CPU use under about 5% of one core, so it stays a
+1s tick where that is affordable and slows down where it isn't — rather
+than becoming part of the problem on exactly the machines you opened it to
+investigate. **Settings → Sampling** shows the measured cost and the
+interval in effect, and lets you pin a fixed interval instead.
+
+Two things make it cheaper still. Minimizing the window stops sampling
+outright (Windows stops drawing the window, and rMon will not sample into
+a screen nobody is updating); it resumes when you restore it. Hidden in
+the tray, where the window does keep drawing, it drops to one sample every
+10s — slow rather than stopped, because the accumulated-usage ranking and
+the leak/idle trends integrate CPU over elapsed time and so still total
+correctly at that cadence.
 
 ## Temperature, fans, and throttle telemetry
 
@@ -425,14 +486,17 @@ $env:RMON_LLM_MODEL   = "<a model the gateway serves>"
 $env:RMON_LLM_BASE_URL = "https://gateway-dev.mezzanin.eu/v1"
 ```
 
-The key is read from the environment (`RMON_LLM_API_KEY`, falling back to
-`OPENAI_API_KEY`) and is never written to the SQLite store, the config, or
-the repo. With no key the tab explains what to set instead of failing.
+The same values can be entered under **Settings → Analyze (LLM)**. A saved
+key is DPAPI-sealed for the current Windows account in
+`%APPDATA%\rMon\config.json`; it is never written to SQLite, logs, or the
+repo. Environment variables remain the fallback. With no key/model the tab
+explains what to configure instead of failing.
 
 ### What it can and cannot do
 
 Its tools are rMon's read paths: system thermal/throttle/fan state, ranked
-process listings, per-process detail, and the leak/idle trend suspects.
+process listings, per-process detail, installed-program inventory/detail
+with live attribution, and the leak/idle trend suspects.
 
 The only action it can reach is `propose_kill_process`, and that **does not
 kill anything** — it returns a proposal that appears in the tab with

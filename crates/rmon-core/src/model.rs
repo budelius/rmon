@@ -50,6 +50,12 @@ pub struct ProcessSample {
     /// Full command line, when readable (own processes always; others
     /// require running elevated).
     pub command_line: Option<String>,
+    /// Fully qualified executable image path, resolved once when the pid is
+    /// first observed. This is the primary evidence used to associate a
+    /// process with an installed program; the image name alone is not a
+    /// trustworthy identity.
+    #[serde(default)]
+    pub executable_path: Option<String>,
     /// Total open handle count (all types, not just files) — cheap via
     /// `GetProcessHandleCount`, unlike the full file-handle scan in
     /// `handles.rs`.

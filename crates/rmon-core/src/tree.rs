@@ -141,6 +141,7 @@ pub fn merge_recent_exits(
                 gpu_source: GpuSource::Unavailable,
                 user: None,
                 command_line: None,
+                executable_path: None,
                 handle_count: None,
                 mem_bytes: None,
             });
@@ -214,6 +215,7 @@ mod tests {
             gpu_source: GpuSource::Unavailable,
             user: None,
             command_line: None,
+            executable_path: None,
             handle_count: None,
             mem_bytes: None,
         }

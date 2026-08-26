@@ -36,14 +36,16 @@ cargo run -p rmon-cli -- mcp
 - CPU/GPU percentages are sample deltas: tests and callers may need a warm-up sample.
 - The MCP server uses stdout exclusively for JSON-RPC framing. Never print diagnostics or progress to stdout while serving MCP; use stderr/logging.
 - WMI/COM-backed sampler state is thread-affine. Do not move sampling between arbitrary async worker threads.
-- Keep GUI/TUI sampling work off rendering/input paths when it can block.
+- Keep GUI/TUI sampling work off rendering/input paths when it can block. In the GUI this is `crates/rmon-gui/src/sampling.rs`: the `Sampler` is created on, and never leaves, one dedicated thread. Two invariants there are easy to break — the UI must call `mark_alive()` every frame (eframe stops calling `App::ui` while the window is minimized, so without it rMon samples forever into a channel nobody drains), and the sampling interval must stay derived from measured cost rather than hardcoded, since a sample costs a few ms on a quiet box and ~100ms on a busy one.
+- Anything recomputed per tick must be cheap at the *largest* history rMon retains, not just at startup. Trend analysis walks every pid's bucketed series, so it runs on its own slower timer; check the growth curve before adding another per-tick pass over history.
 - Kernel-backed sensors are strictly optional. rMon never installs the PawnIO driver and must degrade to the HWiNFO/ACPI fallbacks (and say so) when it is absent, when rMon isn't elevated, or when the hardware isn't recognised.
 - Do not rebuild or substitute the blobs in `vendor/pawnio/`: the driver only accepts modules carrying the upstream signature. Update them by re-vendoring a PawnIO.Modules release and bumping `MODULES_VERSION`.
 - Super I/O access must hold the `Access_ISABUS.HTP.Method` mutex, and skip the read rather than block when another tool holds it. Adding fan *writes* means also handling the conflict with a running FanControl and restoring the initial PWM state on exit.
 - Keep measured and inferred throttling distinguishable all the way to the UI (`cpu_throttle_confirmed`); never render a heuristic guess with the same words as a hardware-reported fact.
 - The analysis agent must stay unable to change the machine. `propose_kill_process` returns a proposal; the kill runs from the UI's button handler only. Do not add a tool that mutates state without an explicit human approval step, and keep telling the model that nothing was executed.
 - Tool output must preserve the "measured zero" vs "could not measure" distinction as `null`. A model handed a fabricated zero will rule out causes it has no evidence about.
-- LLM credentials come from the environment only (`RMON_LLM_API_KEY`/`OPENAI_API_KEY`). Never persist them to the store, config, or logs.
+- Installed-program inventory is best-effort Win32/MSI Uninstall-registry data, not a complete Store/portable-app inventory. `ParentKeyName` links and observed process parentage must never be presented as a universal package dependency graph, and session inactivity must never be labeled “unused” or “safe to uninstall.” rMon does not execute uninstall commands.
+- LLM credentials may come from `RMON_LLM_API_KEY`/`OPENAI_API_KEY` or the Settings UI. Saved keys must remain DPAPI/Windows-Hello protected and must never be persisted in plaintext, SQLite, or logs.
 - Observability is environment-driven and must remain a no-op when its variables are unset. See `crates/rmon-core/OBSERVABILITY.md`.
 - Do not commit `target/`, SQLite/CSV runtime output, or `hook_outputs/`.
 

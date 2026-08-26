@@ -7,6 +7,7 @@ pub mod elevate;
 mod gpu;
 mod handles;
 mod health;
+pub mod hello;
 mod history;
 mod hwinfo;
 mod model;
@@ -14,6 +15,7 @@ pub mod observability;
 pub mod pawnio;
 mod ports;
 mod proc_events;
+mod programs;
 mod sampler;
 pub mod sensors;
 mod storage;
@@ -38,6 +40,11 @@ pub use model::{
 };
 pub use ports::{PortEntry, Protocol, TcpState, list_all_ports, listening_ports_for};
 pub use proc_events::{RecentExit, ShortLivedWatcher};
+pub use programs::{
+    InstalledProgram, InstalledProgramsScan, ProcessProgramLink, ProgramActivity,
+    ProgramAttribution, ProgramRelationship, ProgramScope, attribute_processes,
+    list_installed_programs, process_attention_reasons, program_relationships,
+};
 pub use sampler::Sampler;
 pub use sensors::{
     BoardTemperatureReading, Chip as SuperIoChip, FanReading, PackageThermal, SensorHub,

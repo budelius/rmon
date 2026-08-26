@@ -9,8 +9,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rmon_core::{
     DEFAULT_SCAN_WORKERS, GpuSource, PortEntry, ProcessSample, Sampler, Snapshot, Store,
-    SystemMetrics, build_tree, check_hardware_health, list_all_ports, list_open_files,
-    list_open_files_many,
+    SystemMetrics, attribute_processes, build_tree, check_hardware_health, list_all_ports,
+    list_installed_programs, list_open_files, list_open_files_many, program_relationships,
 };
 
 #[derive(Parser)]
@@ -79,6 +79,20 @@ enum Command {
         #[arg(long)]
         ports_only: bool,
     },
+    /// Inventory conventional installed Win32/MSI programs and correlate them
+    /// with live processes, including children launched by an app.
+    Programs {
+        /// Match display name, publisher, version, or install location.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Show only programs with a live executable or launched child.
+        #[arg(long)]
+        active: bool,
+        /// Show conservative uninstall-review candidates. This is not a
+        /// claim that they are unused or safe to remove.
+        #[arg(long)]
+        review: bool,
+    },
     /// Run an MCP (Model Context Protocol) server over stdio, exposing snapshot/tree,
     /// per-process detail, ports, and cross-process search as tools for MCP clients.
     Mcp,
@@ -132,6 +146,11 @@ fn main() -> Result<()> {
             filter,
         } => run_ports(pid, listening, filter),
         Command::Search { query, ports_only } => run_search(query, ports_only),
+        Command::Programs {
+            filter,
+            active,
+            review,
+        } => run_programs(filter, active, review),
         Command::Mcp => mcp::run(),
         Command::Health { days, max_events } => run_health(days, max_events),
         Command::Sensors { raw } => run_sensors(raw),
@@ -140,6 +159,107 @@ fn main() -> Result<()> {
         rmon_core::observability::capture_anyhow(err);
     }
     result
+}
+
+fn run_programs(filter: Option<String>, active_only: bool, review_only: bool) -> Result<()> {
+    let scan = list_installed_programs();
+    let mut sampler = Sampler::new();
+    let snapshot = sampler.sample();
+    let attribution = attribute_processes(&scan.programs, &snapshot.processes);
+    let activities: std::collections::HashMap<_, _> = attribution
+        .activities
+        .iter()
+        .map(|activity| (activity.program_id.as_str(), activity))
+        .collect();
+    let relationships = program_relationships(&scan.programs);
+    let filter = filter.unwrap_or_default().to_ascii_lowercase();
+
+    println!(
+        "{:<42} {:<16} {:<24} {:>5} {:>8} {:>10}",
+        "PROGRAM", "VERSION", "PUBLISHER", "PROCS", "CPU%", "MEMORY"
+    );
+    let mut shown = 0usize;
+    for program in &scan.programs {
+        let haystack = format!(
+            "{} {} {} {}",
+            program.name,
+            program.version.as_deref().unwrap_or(""),
+            program.publisher.as_deref().unwrap_or(""),
+            program.install_location.as_deref().unwrap_or("")
+        )
+        .to_ascii_lowercase();
+        if !filter.is_empty() && !haystack.contains(&filter) {
+            continue;
+        }
+        let activity = activities.get(program.id.as_str()).copied();
+        let active = activity.is_some_and(|activity| activity.active());
+        if active_only && !active {
+            continue;
+        }
+        let has_dependents = relationships
+            .iter()
+            .any(|relationship| relationship.parent_id == program.id);
+        let reviewable = !active
+            && !has_dependents
+            && !program.system_component
+            && !program.update_or_hotfix
+            && program.has_uninstaller();
+        if review_only && !reviewable {
+            continue;
+        }
+        println!(
+            "{:<42} {:<16} {:<24} {:>5} {:>8.1} {:>10}",
+            truncate_column(&program.name, 42),
+            truncate_column(program.version.as_deref().unwrap_or("-"), 16),
+            truncate_column(program.publisher.as_deref().unwrap_or("unknown"), 24),
+            activity.map_or(0, |activity| activity.process_count()),
+            activity.map_or(0.0, |activity| activity.cpu_percent),
+            activity.map_or_else(
+                || "-".to_string(),
+                |activity| format_bytes(activity.memory_bytes)
+            ),
+        );
+        shown += 1;
+    }
+    println!(
+        "\n{shown} of {} installed-program entries shown",
+        scan.programs.len()
+    );
+    println!(
+        "Inventory coverage: conventional Win32/MSI Uninstall registry entries. Portable and some Store apps may be absent."
+    );
+    if review_only {
+        println!(
+            "Review list only: idle now and no registry blocker is not proof an app is unused or safe to uninstall."
+        );
+    }
+    for warning in scan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn truncate_column(value: &str, max: usize) -> String {
+    let count = value.chars().count();
+    if count <= max {
+        value.to_string()
+    } else {
+        value
+            .chars()
+            .take(max.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * MIB;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
 }
 
 fn run_files(pid: u32, filter: Option<String>) -> Result<()> {

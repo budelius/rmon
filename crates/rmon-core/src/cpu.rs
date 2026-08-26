@@ -9,11 +9,11 @@
 //! syscall: image name, pid/ppid, kernel+user CPU times, working set,
 //! and open handle count. That covers everything rMon needs every tick.
 //!
-//! The two fields that genuinely require opening each process — the owning
-//! user and the command line — are resolved once per *new* pid and cached
-//! (a handful per tick in steady state), not re-queried for every process
-//! every tick. Processes we can't open (other users', protected, when not
-//! elevated) just get `None` for both, same as before.
+//! The fields that genuinely require opening each process — owning user,
+//! command line, and full executable path — are resolved once per *new* pid
+//! and cached (a handful per tick in steady state), not re-queried for every
+//! process every tick. Processes we cannot open (protected, or other users'
+//! when not elevated) keep those fields as `None` rather than failing the scan.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -24,7 +24,8 @@ use windows::Win32::Security::{
     GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -45,6 +46,7 @@ pub struct ProcCpuInfo {
     pub ppid: Option<u32>,
     pub user: Option<String>,
     pub command_line: Option<String>,
+    pub executable_path: Option<String>,
     /// Working-set bytes, straight from the process list snapshot.
     pub mem_bytes: u64,
     /// Total open handle count, straight from the process list snapshot —
@@ -96,12 +98,13 @@ struct ProcessorPerf {
 }
 
 /// Cross-tick per-pid state that's expensive to recompute: the previous
-/// CPU time reading (for the delta) and the once-resolved user/cmdline.
+/// CPU time reading (for the delta) and once-resolved process metadata.
 struct ProcCache {
     name: String,
     cpu_time_100ns: u64,
     user: Option<String>,
     command_line: Option<String>,
+    executable_path: Option<String>,
 }
 
 pub struct CpuMonitor {
@@ -187,9 +190,9 @@ impl CpuMonitor {
                     }
                     _ => 0.0,
                 };
-                let (user, command_line) = match prior {
-                    Some(c) => (c.user, c.command_line),
-                    None => query_user_and_cmdline(pid),
+                let (user, command_line, executable_path) = match prior {
+                    Some(c) => (c.user, c.command_line, c.executable_path),
+                    None => query_process_metadata(pid),
                 };
 
                 out.insert(
@@ -201,6 +204,7 @@ impl CpuMonitor {
                             .then_some(entry.inherited_from_unique_process_id as u32),
                         user: user.clone(),
                         command_line: command_line.clone(),
+                        executable_path: executable_path.clone(),
                         mem_bytes: entry.working_set_size as u64,
                         handle_count: Some(entry.handle_count),
                     },
@@ -212,6 +216,7 @@ impl CpuMonitor {
                         cpu_time_100ns: cpu_time,
                         user,
                         command_line,
+                        executable_path,
                     },
                 );
             }
@@ -330,20 +335,39 @@ unsafe fn nt_query_information_process(
     }
 }
 
-/// Best-effort owning user name and command line for `pid` — the two
-/// fields that need an open process handle. Called once per newly seen
+/// Best-effort owning user, command line, and executable path for `pid` —
+/// the fields that need an open process handle. Called once per newly seen
 /// pid, not per tick.
-fn query_user_and_cmdline(pid: u32) -> (Option<String>, Option<String>) {
+fn query_process_metadata(pid: u32) -> (Option<String>, Option<String>, Option<String>) {
     let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
     else {
-        return (None, None);
+        return (None, None, None);
     };
     let user = unsafe { query_user(process) };
     let command_line = unsafe { query_cmdline(process) };
+    let executable_path = unsafe { query_executable_path(process) };
     unsafe {
         let _ = CloseHandle(process);
     }
-    (user, command_line)
+    (user, command_line, executable_path)
+}
+
+unsafe fn query_executable_path(process: HANDLE) -> Option<String> {
+    // The documented maximum Win32 path accepted by this API is 32,767
+    // UTF-16 code units when long paths are enabled. This runs once per new
+    // pid, so a fixed buffer avoids a retry without affecting tick cost.
+    let mut path = vec![0u16; 32_768];
+    let mut len = path.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    (len > 0).then(|| String::from_utf16_lossy(&path[..len as usize]))
 }
 
 unsafe fn query_cmdline(process: HANDLE) -> Option<String> {
@@ -465,6 +489,13 @@ mod tests {
         assert!(me.mem_bytes > 1024 * 1024, "working set: {}", me.mem_bytes);
         assert!(me.handle_count.is_some_and(|h| h > 0));
         assert!(me.user.is_some(), "own process user must resolve");
+        assert!(
+            me.executable_path
+                .as_deref()
+                .is_some_and(|path| path.to_lowercase().ends_with(&exe_name.to_lowercase())),
+            "executable path: {:?}",
+            me.executable_path
+        );
         assert!(
             me.command_line
                 .as_deref()

@@ -7,6 +7,49 @@ that does not depend on remembering what you installed.
 
 ## 0.2.0 — 2026-08-25
 
+### Installed programs, provenance, and software diagnosis
+
+- New **programs** tab and `rmon programs` command inventory conventional
+  Win32/MSI installs from all per-user/per-machine 32/64-bit Uninstall
+  registry views.
+- Full executable paths associate running processes with install locations;
+  parent chains expose launched children and inclusive resources, so a
+  launcher such as Warp can show that it started `find.exe`.
+- Known installer parent/dependent entries stay distinct from observed
+  process parentage. rMon says explicitly that Windows does not expose a
+  universal Win32 dependency graph or reliable last-used timestamp.
+- Conservative **removal review** excludes active/session-observed software,
+  system components, updates, entries without uninstallers, and entries with
+  known dependents. Results are candidates to investigate, never “safe.”
+  rMon does not run uninstall commands.
+- Process and program details can ask Analyze for a purpose/suspicion/removal
+  assessment. The model receives paths, publisher metadata, command lines,
+  process lineage, and measured resources, and is told to separate evidence
+  from familiarity and missing information.
+
+### Windows Hello on the stored key
+
+- **Settings → Analyze (LLM)** gained *Require Windows Hello to use this key*.
+  With it on, reading the key needs a face, fingerprint, or PIN — closing the
+  gap the DPAPI-only seal openly admits to, where any code already running as
+  you can decrypt it silently.
+- Hello signs rather than encrypts, so the signature becomes the secret: a
+  stored random challenge is signed (deterministically, RSASSA-PKCS#1 v1.5)
+  and the 256-byte result is handed to DPAPI as its entropy. The two
+  protections compose — opening the blob needs your DPAPI master key *and* a
+  live gesture. No cipher is implemented here; it is the same DPAPI call with
+  different entropy.
+- Turning it on clears the unprotected copy. Leaving one behind would keep a
+  route around the gesture.
+- One gesture per session rather than per question: the analyze tab has an
+  **Unlock with Windows Hello** button, and the key is held in memory only
+  until rMon exits.
+- The checkbox hides itself where Hello is not enrolled, and a cancelled
+  gesture resets it, so it never claims a protection that was not applied.
+- **Losing the Hello credential loses the key.** A PIN reset, biometric
+  re-enrolment, or TPM clear destroys it, and the gateway cannot reissue one —
+  a lost key must be replaced and the old alias revoked.
+
 ### rMon costs a lot less to run
 
 - **Sampling moved off the UI thread.** One tick asks the kernel for every
@@ -20,10 +63,15 @@ that does not depend on remembering what you installed.
   machines you would open a monitor to investigate back off on their own,
   instead of the monitor becoming part of the problem. **Settings →
   Sampling** shows the measured cost and lets you pin a fixed interval.
-- **A hidden window samples every 10s instead of every second.** Minimized
-  or tucked in the tray counts. Not paused — accumulated totals and leak
-  trends integrate CPU over elapsed time, so a slower cadence still adds
-  up correctly, and 10s is exactly the per-tick cap the history keeps.
+- **A minimized rMon samples nothing at all.** The window stops being
+  drawn when you minimize it, and the sampling thread now requires proof
+  that frames are still happening before it takes a sample — so it costs
+  nothing while minimized, and picks up again the moment you restore it.
+- **Tucked in the tray, it samples every 10s.** A tray-hidden window keeps
+  drawing, so that case gets a slow cadence rather than a stop:
+  accumulated totals and leak trends integrate CPU over elapsed time, so
+  they still add up correctly, and 10s is exactly the per-tick cap the
+  history keeps.
 - **Leak/idle trend analysis runs every 30s, not every tick.** Its input
   series gains one point per minute and its verdicts need 30 minutes of
   history, so per-tick analysis was recomputing the same answer up to
