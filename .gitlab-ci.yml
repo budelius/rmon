@@ -10,6 +10,13 @@ stages:
 .windows_rust:
   tags:
     - saas-windows-medium-amd64
+  # GitLab's default is 1h, which the installer job overran while still
+  # compiling: it builds cargo-wix from source and then does two release
+  # builds -- and `[profile.release] lto = true` means a fat LTO link over
+  # wgpu/eframe -- with no dependency cache, on a shared Windows runner.
+  # The build job lands around 45 minutes for the same reason, so raise it
+  # for both rather than waiting for that one to start failing too.
+  timeout: 3h
   before_script:
     # Rust isn't preinstalled on the Windows SaaS runner image; bootstrap it
     # the same way a real dev machine would.
