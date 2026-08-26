@@ -98,8 +98,9 @@ enum Command {
     Mcp,
     /// Best-effort hardware health signals: WHEA event log entries, BIOS version,
     /// and CPU microcode revision. Facts only — doesn't diagnose degradation itself.
-    /// The WHEA query is slow (a notoriously unindexed WMI class) and can take up
-    /// to 30+ seconds on a system that logs WHEA entries frequently.
+    /// The WHEA query reads the System channel through `EvtQuery`, which
+    /// answers from the channel's per-provider index — tens of
+    /// milliseconds, and flat in `--days`.
     Health {
         /// How many days back to search the System event log for WHEA entries.
         #[arg(long, default_value_t = rmon_core::DEFAULT_WHEA_LOOKBACK_DAYS)]
@@ -597,10 +598,11 @@ fn run_health(days: i64, max_events: usize) -> Result<()> {
         None => {
             println!(
                 "WHEA events in the last {days} day(s): {} shown (capped at {max_events}), \
-                 {} error(s), {} warning(s) among those shown",
+                 {} error(s), {} warning(s) among those shown — queried in {}ms",
                 report.whea_events.len(),
                 report.whea_error_count,
                 report.whea_warning_count,
+                report.whea_query_ms,
             );
             for e in &report.whea_events {
                 println!(
@@ -657,13 +659,15 @@ fn truncate(name: &str, max: usize) -> &str {
 }
 
 fn print_table(snapshot: &Snapshot, top: usize) {
+    // "CPU%" alone is ambiguous: this column is percent of one core, so a
+    // process saturating a single thread shows 100 on a 32-core machine.
     println!(
-        "{:<8} {:<32} {:>8} {:>8} {:<6}",
-        "PID", "NAME", "CPU%", "GPU%", "SRC"
+        "{:<8} {:<32} {:>9} {:>8} {:<6}",
+        "PID", "NAME", "CPU%/CORE", "GPU%", "SRC"
     );
     for p in snapshot.sorted_by_usage().into_iter().take(top) {
         println!(
-            "{:<8} {:<32} {:>8.1} {:>8.1} {:<6}",
+            "{:<8} {:<32} {:>9.1} {:>8.1} {:<6}",
             p.pid,
             truncate(&p.name, 32),
             p.cpu_percent,
@@ -672,17 +676,20 @@ fn print_table(snapshot: &Snapshot, top: usize) {
         );
     }
     println!(
-        "\n{} processes, total CPU {:.1}%, total GPU {:.1}%",
+        "\n{} processes, total CPU {:.1}% of machine ({:.1}% in the single-core units \
+         used above, across {} logical cores), total GPU {:.1}%",
         snapshot.processes.len(),
+        snapshot.total_cpu_percent_of_machine(),
         snapshot.total_cpu_percent(),
+        snapshot.logical_cores(),
         snapshot.total_gpu_percent()
     );
 }
 
 fn print_tree(snapshot: &Snapshot, top: usize, subtree: bool) {
     println!(
-        "{:<8} {:<40} {:>8} {:>8} {:<6}",
-        "PID", "NAME", "CPU%", "GPU%", "SRC"
+        "{:<8} {:<40} {:>9} {:>8} {:<6}",
+        "PID", "NAME", "CPU%/CORE", "GPU%", "SRC"
     );
     let rows = build_tree(
         &snapshot.processes,
@@ -694,7 +701,7 @@ fn print_tree(snapshot: &Snapshot, top: usize, subtree: bool) {
         let prefix = if depth > 0 { "└ " } else { "" };
         let name = format!("{indent}{prefix}{}", p.name);
         println!(
-            "{:<8} {:<40} {:>8.1} {:>8.1} {:<6}",
+            "{:<8} {:<40} {:>9.1} {:>8.1} {:<6}",
             p.pid,
             truncate(&name, 40),
             p.cpu_percent,
@@ -820,9 +827,10 @@ fn run_record(
         ticks += 1;
         if ticks.is_multiple_of(10) {
             println!(
-                "{ticks} samples taken, {} processes, total CPU {:.1}%, total GPU {:.1}%   {}",
+                "{ticks} samples taken, {} processes, total CPU {:.1}% of machine, \
+                 total GPU {:.1}%   {}",
                 snapshot.processes.len(),
-                snapshot.total_cpu_percent(),
+                snapshot.total_cpu_percent_of_machine(),
                 snapshot.total_gpu_percent(),
                 thermal_summary(&snapshot.system)
             );

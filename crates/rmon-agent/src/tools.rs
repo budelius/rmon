@@ -114,7 +114,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "process_detail",
             "Everything known about one process: usage, owner, command line, memory, \
-             handles, and any leak or idle-burner trend flagged for it.",
+             handles, and any leak, idle-burner or orphan-burner trend flagged for it.",
             json!({
                 "type": "object",
                 "properties": {"pid": {"type": "integer", "description": "Process ID"}},
@@ -124,9 +124,11 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "trend_suspects",
             "Processes flagged by rMon's trend analysis as possible handle or memory \
-             leaks (sustained monotonic growth over 30+ minutes) or idle burners (large \
-             accumulated CPU while currently near-idle). These are heuristics over this \
-             session's history, not confirmed diagnoses.",
+             leaks (sustained monotonic growth over 30+ minutes), idle burners (large \
+             accumulated CPU while currently near-idle), or orphan burners (still \
+             burning at least half a core with no living parent — a runaway whose \
+             launcher exited). These are heuristics over this session's history, not \
+             confirmed diagnoses.",
             json!({"type": "object", "properties": {}}),
         ),
         spec(
@@ -308,17 +310,33 @@ fn system_metrics(ctx: &ToolContext) -> Value {
                      that is not the same as zero",
         },
         "sensor_source": s.sensor_source,
+        "logical_cores": s.logical_cores,
         "totals": {
             "cpu_percent_all_processes": ctx.snapshot.total_cpu_percent(),
+            "cpu_percent_of_machine_all_processes": ctx.snapshot.total_cpu_percent_of_machine(),
             "gpu_percent_all_processes": ctx.snapshot.total_gpu_percent(),
         },
+        "cpu_units": CPU_UNITS_NOTE,
     })
 }
 
+/// Attached to every tool result carrying per-process CPU numbers.
+///
+/// rMon reports CPU the way Process Explorer does — percent of one core —
+/// and a reader that assumes Task Manager's convention overstates a
+/// single-threaded process by the core count. That misreading repeatedly
+/// sent investigations after the wrong process, so the units travel with
+/// the data rather than living only in a tool description.
+const CPU_UNITS_NOTE: &str = "cpu_percent is percent of ONE core (Process Explorer convention), so it reaches 100 * logical_cores on a fully loaded machine; cpu_percent_of_machine is the same figure as a 0-100 share of the whole machine (Task Manager convention). Rank and reason about load using cpu_percent_of_machine unless you specifically mean per-thread saturation — a single-threaded process pegging one core reads 100 here but is only ~3% of a 32-core machine.";
+
 fn top_processes(ctx: &ToolContext, args: TopArgs) -> Value {
     let limit = args.limit.unwrap_or(DEFAULT_TOP).clamp(1, MAX_TOP);
+    let cores = ctx.snapshot.logical_cores();
     let mut procs: Vec<_> = ctx.snapshot.processes.iter().collect();
     let key = args.sort_by.as_deref().unwrap_or("total");
+    // Ranking is unaffected by the choice of units — dividing every
+    // process by the same core count preserves the order — so the raw
+    // per-core figure is used here and both are reported below.
     procs.sort_by(|a, b| {
         let score = |p: &rmon_core::ProcessSample| match key {
             "cpu" => p.cpu_percent as f64,
@@ -333,12 +351,15 @@ fn top_processes(ctx: &ToolContext, args: TopArgs) -> Value {
 
     json!({
         "sorted_by": key,
+        "logical_cores": cores,
+        "cpu_units": CPU_UNITS_NOTE,
         "processes": procs.iter().take(limit).map(|p| json!({
             "pid": p.pid,
             "parent_pid": p.ppid,
             "name": p.name,
             "executable_path": p.executable_path,
             "cpu_percent": p.cpu_percent,
+            "cpu_percent_of_machine": ctx.snapshot.cpu_percent_of_machine(p),
             "gpu_percent": p.gpu_percent,
             "memory_bytes": p.mem_bytes,
             "handle_count": p.handle_count,
@@ -358,6 +379,9 @@ fn process_detail(ctx: &ToolContext, pid: u32) -> Value {
         "parent_pid": p.ppid,
         "name": p.name,
         "cpu_percent": p.cpu_percent,
+        "cpu_percent_of_machine": ctx.snapshot.cpu_percent_of_machine(p),
+        "logical_cores": ctx.snapshot.logical_cores(),
+        "cpu_units": CPU_UNITS_NOTE,
         "gpu_percent": p.gpu_percent,
         "gpu_source": p.gpu_source.as_str(),
         "memory_bytes": p.mem_bytes,
@@ -383,6 +407,8 @@ fn process_detail(ctx: &ToolContext, pid: u32) -> Value {
             "handle_leak_suspect": t.handle_leak_suspect,
             "memory_leak_suspect": t.mem_leak_suspect,
             "idle_burner": t.idle_burner,
+            "orphaned": t.orphaned,
+            "orphan_burner": t.orphan_burner,
             "verdict": t.verdict,
         })),
     })
@@ -591,6 +617,9 @@ fn trend_suspects(ctx: &ToolContext) -> Value {
                 "handle_leak_suspect": t.handle_leak_suspect,
                 "memory_leak_suspect": t.mem_leak_suspect,
                 "idle_burner": t.idle_burner,
+                "orphaned": t.orphaned,
+                "orphan_burner": t.orphan_burner,
+                "parent_pid": t.parent_pid,
                 "verdict": t.verdict,
             })
         })

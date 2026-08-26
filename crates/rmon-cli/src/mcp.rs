@@ -61,6 +61,15 @@ pub fn run() -> Result<()> {
     })
 }
 
+/// Attached to every tool result carrying per-process CPU numbers.
+///
+/// rMon reports CPU the way Process Explorer does — percent of one core —
+/// and a reader that assumes Task Manager's convention overstates a
+/// single-threaded process by the core count. That misreading repeatedly
+/// sent investigations after the wrong process, so the units travel with
+/// the data rather than living only in a tool description.
+const CPU_UNITS_NOTE: &str = "cpu_percent is percent of ONE core (Process Explorer convention), so it reaches 100 * logical_cores on a fully loaded machine; cpu_percent_of_machine is the same figure as a 0-100 share of the whole machine (Task Manager convention). Rank and reason about load using cpu_percent_of_machine unless you specifically mean per-thread saturation — a single-threaded process pegging one core reads 100 here but is only ~3% of a 32-core machine.";
+
 fn to_mcp_err(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
@@ -71,12 +80,17 @@ fn text_result(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
     )]))
 }
 
-fn process_json(p: &ProcessSample) -> serde_json::Value {
+/// `logical_cores` is passed in rather than read from the process because
+/// a `ProcessSample` has no idea how big the machine is — and a CPU
+/// percentage without that divisor is exactly the ambiguity that kept
+/// getting read as "this process is eating the box".
+fn process_json(p: &ProcessSample, logical_cores: u32) -> serde_json::Value {
     json!({
         "pid": p.pid,
         "ppid": p.ppid,
         "name": p.name,
         "cpu_percent": p.cpu_percent,
+        "cpu_percent_of_machine": p.cpu_percent / logical_cores.max(1) as f32,
         "gpu_percent": p.gpu_percent,
         "gpu_source": p.gpu_source.as_str(),
         "user": p.user,
@@ -113,6 +127,9 @@ fn system_json(s: &SystemMetrics) -> serde_json::Value {
         "cpu_throttle_confirmed": s.cpu_throttle_confirmed,
         "cpu_thermal_throttled_since_boot": s.cpu_thermal_throttled_since_boot,
         "sensor_source": s.sensor_source,
+        // The divisor for every per-process cpu_percent in this server's
+        // output. Without it those numbers cannot be read correctly.
+        "logical_cores": s.logical_cores,
         "fans": s.fans.iter().map(|f| json!({
             "label": f.label,
             "rpm": f.rpm,
@@ -290,7 +307,7 @@ impl RmonMcpServer {
     }
 
     #[tool(
-        description = "Current process list ranked by combined CPU%+GPU% usage, plus system-wide totals. CPU%/GPU% reflect the delta since the last snapshot/tree tool call from any client."
+        description = "Current process list ranked by combined CPU%+GPU% usage, plus system-wide totals. CPU%/GPU% reflect the delta since the last snapshot/tree tool call from any client. cpu_percent is percent of ONE core (Process Explorer convention), so it reaches 100 * logical_cores on a fully loaded machine; cpu_percent_of_machine is the same figure as a 0-100 share of the whole machine (Task Manager convention). Rank and reason about load using cpu_percent_of_machine unless you specifically mean per-thread saturation — a single-threaded process pegging one core reads 100 here but is only ~3% of a 32-core machine."
     )]
     async fn snapshot(
         &self,
@@ -301,12 +318,16 @@ impl RmonMcpServer {
         if let Some(top) = args.top {
             processes.truncate(top);
         }
+        let cores = snap.logical_cores();
         text_result(&json!({
             "timestamp": snap.timestamp.to_rfc3339(),
             "process_count": snap.processes.len(),
+            "logical_cores": cores,
             "total_cpu_percent": snap.total_cpu_percent(),
+            "total_cpu_percent_of_machine": snap.total_cpu_percent_of_machine(),
             "total_gpu_percent": snap.total_gpu_percent(),
-            "processes": processes.iter().map(|p| process_json(p)).collect::<Vec<_>>(),
+            "cpu_units": CPU_UNITS_NOTE,
+            "processes": processes.iter().map(|p| process_json(p, cores)).collect::<Vec<_>>(),
         }))
     }
 
@@ -325,6 +346,7 @@ impl RmonMcpServer {
             .unwrap_or_default();
         let (augmented, ghosts) =
             merge_recent_exits(&snap.processes, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
+        let cores = snap.logical_cores();
         let key = |p: &ProcessSample| p.cpu_percent + p.gpu_percent;
         let mut rows = build_tree(&augmented, key, args.subtree_totals);
         if let Some(top) = args.top {
@@ -333,7 +355,7 @@ impl RmonMcpServer {
         let value: Vec<serde_json::Value> = rows
             .iter()
             .map(|(depth, p)| {
-                let mut v = process_json(p);
+                let mut v = process_json(p, cores);
                 v["depth"] = json!(depth);
                 v["is_ghost"] = json!(ghosts.contains(&p.pid));
                 v
@@ -386,7 +408,7 @@ impl RmonMcpServer {
             .processes
             .iter()
             .find(|p| p.pid == args.pid)
-            .map(process_json);
+            .map(|p| process_json(p, snap.logical_cores()));
         let handles = handle_count(args.pid);
 
         let files = if args.include_files {
@@ -443,7 +465,7 @@ impl RmonMcpServer {
     }
 
     #[tool(
-        description = "Per-process trend analytics over this server's uptime: handle-count and working-set growth (least-squares slope, monotonicity, leak-suspect flags for sustained monotonic growth over >=30 min) and accumulated CPU/GPU core-seconds with 'idle burner' flags (large accumulated CPU while currently near-idle — the classic quietly-misbehaving background process). History is sampled in the background every few seconds but only exists since this MCP server started: with under ~30 minutes of uptime nothing will be flagged yet, and `observed_window_secs` says how much history the verdicts rest on. Flags are conservative heuristics — treat a flagged process as a suspect worth investigating (e.g. restart it and watch whether the count resets then climbs again), not a confirmed leak."
+        description = "Per-process trend analytics over this server's uptime: handle-count and working-set growth (least-squares slope, monotonicity, leak-suspect flags for sustained monotonic growth over >=30 min) and accumulated CPU/GPU core-seconds with 'idle burner' flags (large accumulated CPU while currently near-idle — the classic quietly-misbehaving background process) and 'orphan burner' flags (still burning >=50% of one core with no living parent — a runaway whose launcher exited, which nothing is left to reap). `orphaned` on its own is informational, not a fault: anything started from a shell that has since closed is an orphan. History is sampled in the background every few seconds but only exists since this MCP server started: with under ~30 minutes of uptime nothing will be flagged yet, and `observed_window_secs` says how much history the verdicts rest on. Flags are conservative heuristics — treat a flagged process as a suspect worth investigating (e.g. restart it and watch whether the count resets then climbs again), not a confirmed leak."
     )]
     async fn process_trends(
         &self,
@@ -563,7 +585,7 @@ impl RmonMcpServer {
     }
 
     #[tool(
-        description = "Best-effort hardware health signals: WHEA (Windows Hardware Error Architecture) event log entries from the System log, BIOS version, and CPU microcode revision. Facts only — this does not itself diagnose silicon degradation; weigh Error-level WHEA entries alongside other evidence like new instability under load, and cross-reference the microcode/BIOS versions against your CPU/motherboard vendor's own advisories. The WHEA query walks the System event log via WMI (Win32_NTLogEvent), which is slow and can take up to ~30 seconds (more on a system that logs WHEA entries frequently) — this is normal, not a hang."
+        description = "Best-effort hardware health signals: WHEA (Windows Hardware Error Architecture) event log entries from the System log, BIOS version, and CPU microcode revision. Facts only — this does not itself diagnose silicon degradation; weigh Error-level WHEA entries alongside other evidence like new instability under load, and cross-reference the microcode/BIOS versions against your CPU/motherboard vendor's own advisories. The WHEA query uses EvtQuery against the System channel's per-provider index, so it costs tens of milliseconds and does not get slower with a longer lookback; `whea_query_ms` reports what it actually took."
     )]
     async fn hardware_health(
         &self,

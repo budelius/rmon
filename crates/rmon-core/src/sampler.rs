@@ -158,6 +158,7 @@ impl Sampler {
             board_temperatures,
             voltages,
             sensor_source: Some(self.sensors.status_line()),
+            logical_cores: self.cpu.logical_cores(),
             gpus: self.gpu.telemetry(),
         };
 

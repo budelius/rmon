@@ -239,13 +239,23 @@ press `H` (TUI), or run `rmon health` (CLI) for:
   rMon deliberately doesn't try to know which versions fix which errata,
   since that guidance changes over time and varies by vendor.
 
-This is genuinely slow — `Win32_NTLogEvent` (the only way to read the event
-log via WMI without a separate `EvtQuery`/`wevtapi.dll` FFI layer) has no
-useful server-side filtering beyond `Logfile`/`SourceName`, so a query can
-take anywhere from under a second to 30+ seconds depending on how often the
-system logs WHEA entries. The GUI/TUI run it on a background thread (same
-on-demand philosophy as the Files scan) so it doesn't freeze the UI; the
-CLI and MCP tool just take as long as they take.
+This reads the System channel through `EvtQuery` (`wevtapi`), which answers
+from the channel's per-provider index. rMon used to go through WMI's
+`Win32_NTLogEvent` instead, which cannot use that index and walks the log
+record by record — so its cost scaled with the *window*. Measured against a
+30,138-record System log:
+
+| lookback | `Win32_NTLogEvent` | `EvtQuery` |
+|----------|-------------------:|-----------:|
+| 7 days   |            ~870 ms |    ~130 ms |
+| 30 days  |          ~6,690 ms |     ~47 ms |
+| 365 days |         ~43,945 ms |     ~52 ms |
+
+That is why the default lookback is now 30 days rather than 7: the small
+window existed only to limit the WMI cost. Reports carry `whea_query_ms`,
+so a slow scan is attributable rather than being blamed on whatever process
+happens to be on screen. The GUI/TUI still run it on a background thread
+(same on-demand philosophy as the Files scan).
 
 ### TUI keys
 
@@ -580,9 +590,10 @@ does the on-demand kernel-handle-table walk behind the Files view (fanned
 out across every process by `list_open_files_many`, behind the cross-process
 search). `rmon-core::list_all_ports` reads the system-wide TCP/UDP table
 (`GetExtendedTcpTable`/`GetExtendedUdpTable`) behind the ports views.
-`rmon-core::check_hardware_health` queries WHEA event log entries (via WMI's
-`Win32_NTLogEvent`), BIOS info (`Win32_BIOS`), and the CPU microcode
-revision (registry) behind the hardware-health views.
+`rmon-core::check_hardware_health` queries WHEA event log entries (via
+`wevtapi`'s `EvtQuery` against the System channel), BIOS info
+(`Win32_BIOS`), and the CPU microcode revision (registry) behind the
+hardware-health views.
 
 ## Diagnostics (crash reporting)
 

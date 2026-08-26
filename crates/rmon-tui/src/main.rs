@@ -35,7 +35,7 @@ enum SortMetric {
 impl SortMetric {
     fn label(self) -> &'static str {
         match self {
-            SortMetric::Cpu => "CPU%",
+            SortMetric::Cpu => "CPU%/core",
             SortMetric::Gpu => "GPU%",
             SortMetric::Total => "CPU%+GPU%",
         }
@@ -326,10 +326,10 @@ enum HealthStatus {
     Done(HardwareHealthReport),
 }
 
-/// WHEA event log query is slow (`Win32_NTLogEvent` has no useful
-/// server-side filtering beyond Logfile/SourceName) — up to ~30s on a
-/// system that logs frequently — so this always runs on a background
-/// thread, same as `FilesState`.
+/// The WHEA query is fast now (`EvtQuery` against the System channel's
+/// per-provider index, tens of milliseconds), but it is still I/O and a
+/// cold channel carries no guarantee, so it runs on a background thread,
+/// same as `FilesState`.
 struct HealthState {
     status: HealthStatus,
     list_state: ListState,
@@ -856,9 +856,7 @@ fn ui_health(f: &mut Frame, app: &App) {
             ratatui::widgets::Paragraph::new(vec![
                 title,
                 Line::from(Span::styled(
-                    "querying the System event log for WHEA entries via WMI — slow, \
-                     unindexed query, can take up to ~30s (more on a system that logs \
-                     frequently)",
+                    "querying the System event log for WHEA entries…",
                     Style::default().fg(Color::Yellow),
                 )),
             ]),
@@ -1119,7 +1117,11 @@ fn ui_files(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let total_cpu: f32 = app.rows.iter().map(|(_, p)| p.cpu_percent).sum();
+    // Per-process figures are percent of one core; the header total is
+    // the share of the whole machine, which is what "total CPU" means to
+    // anyone reading it.
+    let cores = app.history.latest().map_or(1, |s| s.logical_cores()).max(1);
+    let total_cpu: f32 = app.rows.iter().map(|(_, p)| p.cpu_percent).sum::<f32>() / cores as f32;
     let total_gpu: f32 = app.rows.iter().map(|(_, p)| p.gpu_percent).sum();
     let gpu_note = if app.has_gpu_source {
         ""
@@ -1151,9 +1153,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         )),
     ]);
     let line2 = Line::from(format!(
-        "processes: {}   total CPU: {:.1}%   total GPU: {:.1}%   accumulation window: {} of up to 24h",
+        "processes: {}   total CPU: {:.1}% of {} cores   total GPU: {:.1}%   accumulation window: {} of up to 24h",
         app.rows.len(),
         total_cpu,
+        cores,
         total_gpu,
         format_duration(app.history.accum_window()),
     ));
@@ -1254,7 +1257,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec![
         Cell::from("PID"),
         Cell::from("NAME"),
-        Cell::from("CPU% (trend)"),
+        Cell::from("CPU%/core (trend)"),
         Cell::from("GPU% (trend)"),
         Cell::from("SRC"),
     ])

@@ -24,8 +24,8 @@ use windows::Win32::Security::{
     GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    GetActiveProcessorCount, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -40,8 +40,17 @@ const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// One process's info from a single sampling tick.
 pub struct ProcCpuInfo {
     pub name: String,
-    /// Percent of a single core (Task Manager style: the sum across all
-    /// processes can exceed 100 on a multi-core system).
+    /// Percent of a *single* core: a process saturating one thread reads
+    /// 100.0 no matter how many cores the machine has, so the sum across
+    /// all processes can reach `100 * logical_cores`.
+    ///
+    /// This is Process Explorer's convention, not Task Manager's — Task
+    /// Manager divides by the core count, so the same busy loop it shows
+    /// as 3% appears here as 100%. Anything rendering this figure to a
+    /// human (or to an LLM) must say which convention it is using, or
+    /// pair it with the machine-relative number derived via
+    /// `SystemMetrics::logical_cores`; reported bare, "100% CPU" reads as
+    /// "consuming the whole machine" when it can mean 1/32nd of it.
     pub cpu_percent: f32,
     pub ppid: Option<u32>,
     pub user: Option<String>,
@@ -117,6 +126,7 @@ pub struct CpuMonitor {
     prev_idle_100ns: u64,
     prev_busy_100ns: u64,
     global_usage: f32,
+    logical_cores: u32,
 }
 
 impl CpuMonitor {
@@ -129,6 +139,7 @@ impl CpuMonitor {
             prev_idle_100ns: 0,
             prev_busy_100ns: 0,
             global_usage: 0.0,
+            logical_cores: active_processor_count(),
         };
         // Establish CPU-time baselines so the caller's own warm-up sample
         // behaves the same as it did with sysinfo (first sample ~0%).
@@ -239,6 +250,13 @@ impl CpuMonitor {
         self.global_usage
     }
 
+    /// Logical processors on this machine — the divisor that turns a
+    /// per-process `cpu_percent` (percent of one core) into percent of
+    /// the whole machine. Never zero.
+    pub fn logical_cores(&self) -> u32 {
+        self.logical_cores
+    }
+
     fn refresh_global_usage(&mut self) {
         let Ok(len) = query_system_buffer(
             SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION_CLASS,
@@ -273,6 +291,23 @@ impl Default for CpuMonitor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Logical processors across *every* processor group, which is what a
+/// per-process CPU time delta is measured against.
+///
+/// Deliberately not `available_parallelism()`: that reports the cores this
+/// process may run on, so an affinity-limited rMon would divide everyone
+/// else's CPU% by its own restriction. Deliberately not the count of
+/// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` entries either — that class
+/// returns only the caller's processor group, undercounting on machines
+/// with more than 64 logical processors.
+fn active_processor_count() -> u32 {
+    // 0xffff == ALL_PROCESSOR_GROUPS.
+    let n = unsafe { GetActiveProcessorCount(0xffff) };
+    // The API returns 0 only on failure; a machine with no cores cannot
+    // be running this code, and a zero would make the divisor explode.
+    n.max(1)
 }
 
 /// Runs `NtQuerySystemInformation(class)` into `buf`, growing it as needed
@@ -512,6 +547,91 @@ mod tests {
         assert!(
             reported.abs_diff(direct) < 200,
             "snapshot handle count {reported} vs direct {direct}"
+        );
+    }
+
+    /// The core count is the divisor that makes `cpu_percent`
+    /// interpretable, so a wrong one silently rescales every reading.
+    /// Cross-checked against the standard library, which agrees whenever
+    /// this process is not affinity-restricted.
+    #[test]
+    fn logical_cores_matches_the_machine() {
+        let monitor = CpuMonitor::new();
+        let cores = monitor.logical_cores();
+        assert!(cores >= 1, "core count must never be zero");
+        let std_cores = std::thread::available_parallelism().unwrap().get() as u32;
+        println!("GetActiveProcessorCount={cores}, available_parallelism={std_cores}");
+        // available_parallelism honors affinity, so it can be lower, but
+        // it can never legitimately exceed the machine's real core count.
+        assert!(
+            cores >= std_cores,
+            "reported {cores} cores but this process can run on {std_cores}"
+        );
+    }
+
+    /// `cpu_percent` must be percent of *one core*, so a process using
+    /// more than one thread exceeds 100. This is the convention every
+    /// consumer divides by `logical_cores` to normalize; if it ever
+    /// silently became machine-relative, those divisions would understate
+    /// every process by the core count.
+    ///
+    /// Deliberately measured with two deliberate threads rather than one:
+    /// `cpu_percent` covers the whole process, and under `cargo test` this
+    /// binary is already running other tests on other threads, so no upper
+    /// bound tied to a single thread is meaningful here.
+    #[test]
+    fn cpu_percent_is_per_core_not_per_machine() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut monitor = CpuMonitor::new();
+        let cores = monitor.logical_cores();
+        if cores < 2 {
+            println!("skipping: needs at least 2 logical cores, machine has {cores}");
+            return;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::black_box(0u64.wrapping_add(1));
+                    }
+                })
+            })
+            .collect();
+
+        monitor.sample();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let procs = monitor.sample();
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            let _ = w.join();
+        }
+
+        let me = procs.get(&std::process::id()).unwrap();
+        println!(
+            "two busy threads: {:.1}% of one core = {:.1}% of {cores}-core machine",
+            me.cpu_percent,
+            me.cpu_percent / (cores as f32)
+        );
+        // The load-bearing assertion: two saturated threads cannot produce
+        // a figure above 100 under a machine-relative convention, so this
+        // fails the moment the units change.
+        assert!(
+            me.cpu_percent > 100.0,
+            "two busy threads read {:.1}%; cpu_percent is no longer per-core",
+            me.cpu_percent
+        );
+        // ...and it still cannot exceed the whole machine. Slack allows for
+        // the sampling interval and CPU-time granularity disagreeing
+        // slightly over a short window.
+        assert!(
+            me.cpu_percent <= 120.0 * cores as f32,
+            "{:.1}% exceeds a {cores}-core machine",
+            me.cpu_percent
         );
     }
 

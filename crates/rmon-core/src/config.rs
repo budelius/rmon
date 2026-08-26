@@ -480,6 +480,9 @@ mod tests {
 
     #[test]
     fn hello_settings_serialise_without_the_plaintext_and_round_trip() {
+        if !can_seal() {
+            return;
+        }
         let mut settings = Settings::default();
         settings.llm.api_key_hello = Some(HelloSealed {
             challenge: to_hex(&[1u8; 32]),

@@ -318,10 +318,10 @@ enum HealthStatus {
     Done(HardwareHealthReport),
 }
 
-/// WHEA event log query is slow (`Win32_NTLogEvent` has no useful
-/// server-side filtering beyond Logfile/SourceName) — up to ~30s on a
-/// system that logs frequently — so like `FilesState`, this always runs on
-/// a background thread rather than blocking the UI.
+/// The WHEA query is fast now (`EvtQuery` against the System channel's
+/// per-provider index, tens of milliseconds), but it is still I/O and a
+/// cold channel carries no guarantee, so like `FilesState` it runs on a
+/// background thread rather than blocking the UI.
 struct HealthState {
     status: HealthStatus,
 }
@@ -1032,9 +1032,10 @@ impl RmonApp {
     /// view needs on first visit.
     fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
-        // The WHEA query is slow enough (up to ~30s) that it runs on first
-        // view rather than at startup. Re-selecting the tab must not throw
-        // away a report that already completed.
+        // Scanned on first view rather than at startup: the report is a
+        // point-in-time fact a user asks for, not something worth doing on
+        // every launch. Re-selecting the tab must not throw away a report
+        // that already completed.
         if tab == Tab::Health && self.health.is_none() {
             self.health = Some(HealthState::start(
                 DEFAULT_WHEA_LOOKBACK_DAYS,
@@ -2290,7 +2291,7 @@ impl RmonApp {
                 .selectable_value(&mut self.sort_metric, SortMetric::Total, "CPU+GPU")
                 .changed();
             metric_changed |= ui
-                .selectable_value(&mut self.sort_metric, SortMetric::Cpu, "CPU%")
+                .selectable_value(&mut self.sort_metric, SortMetric::Cpu, "CPU%/core")
                 .changed();
             metric_changed |= ui
                 .selectable_value(&mut self.sort_metric, SortMetric::Gpu, "GPU%")
@@ -2549,12 +2550,22 @@ impl RmonApp {
     fn draw_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
 
-        let total_cpu: f32 = self.rows.iter().map(|(_, p)| p.cpu_percent).sum();
+        // Rows show percent of one core; this total shows the share of
+        // the whole machine, so it stays inside 0-100 and means what a
+        // reader expects "total CPU" to mean.
+        let cores = self
+            .history
+            .latest()
+            .map_or(1, |s| s.logical_cores())
+            .max(1);
+        let total_cpu: f32 =
+            self.rows.iter().map(|(_, p)| p.cpu_percent).sum::<f32>() / cores as f32;
         let total_gpu: f32 = self.rows.iter().map(|(_, p)| p.gpu_percent).sum();
         ui.label(format!(
-            "{} processes shown   total CPU {:.1}%   total GPU {:.1}%",
+            "{} processes shown   total CPU {:.1}% of {} cores   total GPU {:.1}%",
             self.rows.len(),
             total_cpu,
+            cores,
             total_gpu
         ));
         ui.weak("keyboard: ↑/↓, PgUp/PgDn, Home/End or keypad · right-click a row for actions");
@@ -2620,7 +2631,8 @@ impl RmonApp {
                     let label = if window == SortWindow::Accumulated {
                         "CPU"
                     } else {
-                        "CPU%"
+                        // Percent of one core, not of the machine.
+                        "CPU%/core"
                     };
                     if sort_header(ui, label, active, ascending) {
                         header_click = Some(HeaderClick::Cpu);
@@ -3484,11 +3496,7 @@ impl RmonApp {
         let HealthStatus::Done(report) = &health.status else {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.weak(
-                    "querying the System event log for WHEA entries via WMI — this is a \
-                     slow, unindexed query and can take up to ~30 seconds, more on a system \
-                     that logs frequently",
-                );
+                ui.weak("querying the System event log for WHEA entries…");
             });
             return;
         };

@@ -42,6 +42,11 @@ pub struct ProcessSample {
     pub pid: u32,
     pub ppid: Option<u32>,
     pub name: String,
+    /// Percent of a *single* core, Process Explorer style: a process
+    /// saturating one thread reads 100.0 regardless of machine size.
+    /// Divide by `SystemMetrics::logical_cores` (or use
+    /// `Snapshot::cpu_percent_of_machine`) for the machine-relative
+    /// figure — see that field for why reporting this one bare misleads.
     pub cpu_percent: f32,
     pub gpu_percent: f32,
     pub gpu_source: GpuSource,
@@ -105,7 +110,7 @@ pub struct VoltageSample {
 }
 
 /// System-wide (not per-process) thermal telemetry for one sampling tick.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
     /// CPU temperature in °C from the best source available this tick.
     /// `None` when none of them could answer.
@@ -173,7 +178,43 @@ pub struct SystemMetrics {
     /// One-line description of which sensor backends are live, for the
     /// UI to show instead of leaving unavailable readings unexplained.
     pub sensor_source: Option<String>,
+    /// Logical processors on this machine, across all processor groups.
+    ///
+    /// This is the divisor that makes `ProcessSample::cpu_percent`
+    /// interpretable. Without it a reader cannot tell whether a process
+    /// reading 100.0 has saturated the machine or one thirty-second of
+    /// it, and rMon's own analysis repeatedly ranked ordinary
+    /// single-threaded work as the top offender for exactly that reason.
+    /// Defaults to 1 when deserializing older records, which is the only
+    /// value that leaves the raw percentage unchanged.
+    #[serde(default = "one_core")]
+    pub logical_cores: u32,
     pub gpus: Vec<GpuTelemetry>,
+}
+
+fn one_core() -> u32 {
+    1
+}
+
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_temp_c: None,
+            cpu_temp_source: None,
+            cpu_clock_ratio: None,
+            cpu_thermal_headroom_c: None,
+            cpu_throttled: false,
+            cpu_throttle_reason: None,
+            cpu_throttle_confirmed: false,
+            cpu_thermal_throttled_since_boot: false,
+            fans: Vec::new(),
+            board_temperatures: Vec::new(),
+            voltages: Vec::new(),
+            sensor_source: None,
+            logical_cores: 1,
+            gpus: Vec::new(),
+        }
+    }
 }
 
 /// All process samples collected at a single point in time.
@@ -185,9 +226,31 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Total CPU percent across all sampled processes (can exceed 100 on multi-core systems).
+    /// Total CPU percent across all sampled processes, in single-core
+    /// units — so this legitimately reaches `100 * logical_cores` on a
+    /// fully loaded machine. Use `total_cpu_percent_of_machine` for the
+    /// 0..=100 figure a reader will assume a bare percentage to be.
     pub fn total_cpu_percent(&self) -> f32 {
         self.processes.iter().map(|p| p.cpu_percent).sum()
+    }
+
+    /// Logical processors this snapshot's percentages are measured
+    /// against. Never zero, so it is always safe to divide by.
+    pub fn logical_cores(&self) -> u32 {
+        self.system.logical_cores.max(1)
+    }
+
+    /// `cpu_percent` for one process expressed as a share of the whole
+    /// machine (0..=100), which is what "CPU%" means to nearly everyone
+    /// reading it — Task Manager's convention.
+    pub fn cpu_percent_of_machine(&self, p: &ProcessSample) -> f32 {
+        p.cpu_percent / self.logical_cores() as f32
+    }
+
+    /// Total CPU across all processes as a share of the whole machine
+    /// (0..=100).
+    pub fn total_cpu_percent_of_machine(&self) -> f32 {
+        self.total_cpu_percent() / self.logical_cores() as f32
     }
 
     /// Total GPU percent across all sampled processes.
@@ -204,5 +267,90 @@ impl Snapshot {
             ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
         });
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(pid: u32, cpu: f32) -> ProcessSample {
+        ProcessSample {
+            pid,
+            ppid: None,
+            name: format!("p{pid}"),
+            cpu_percent: cpu,
+            gpu_percent: 0.0,
+            gpu_source: GpuSource::Unavailable,
+            user: None,
+            command_line: None,
+            executable_path: None,
+            handle_count: None,
+            mem_bytes: None,
+        }
+    }
+
+    fn snapshot(cores: u32, cpus: &[f32]) -> Snapshot {
+        Snapshot {
+            timestamp: Utc::now(),
+            processes: cpus
+                .iter()
+                .enumerate()
+                .map(|(i, c)| sample(i as u32 + 1, *c))
+                .collect(),
+            system: SystemMetrics {
+                logical_cores: cores,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The bug this exists to prevent: a single-threaded process pegging
+    /// one core reads 100, which ranked it as though it owned the whole
+    /// machine. On 32 cores it owns about 3% of it.
+    #[test]
+    fn one_saturated_core_is_a_small_share_of_a_big_machine() {
+        let snap = snapshot(32, &[100.0]);
+        let p = &snap.processes[0];
+        assert_eq!(p.cpu_percent, 100.0);
+        assert!((snap.cpu_percent_of_machine(p) - 3.125).abs() < 0.001);
+    }
+
+    /// A fully loaded machine reaches 100% machine-relative, while the
+    /// single-core-relative total reaches 100 * cores.
+    #[test]
+    fn a_saturated_machine_totals_one_hundred_percent() {
+        let snap = snapshot(8, &[100.0; 8]);
+        assert_eq!(snap.total_cpu_percent(), 800.0);
+        assert!((snap.total_cpu_percent_of_machine() - 100.0).abs() < 0.001);
+    }
+
+    /// Single-core machines must be a no-op, not a special case.
+    #[test]
+    fn single_core_normalization_changes_nothing() {
+        let snap = snapshot(1, &[42.0]);
+        assert_eq!(snap.cpu_percent_of_machine(&snap.processes[0]), 42.0);
+    }
+
+    /// A zero core count would make every normalized figure infinite.
+    /// Deserialized older records and hand-built defaults must not be
+    /// able to produce that.
+    #[test]
+    fn core_count_is_never_a_zero_divisor() {
+        let snap = snapshot(0, &[50.0]);
+        assert_eq!(snap.logical_cores(), 1);
+        assert!(snap.cpu_percent_of_machine(&snap.processes[0]).is_finite());
+        // Records written before `logical_cores` existed must deserialize
+        // to 1 rather than 0 — built here by round-tripping a current
+        // record with the field removed, so this keeps testing the real
+        // shape as other fields come and go.
+        let mut fields: serde_json::Value = serde_json::to_value(SystemMetrics::default()).unwrap();
+        fields
+            .as_object_mut()
+            .unwrap()
+            .remove("logical_cores")
+            .unwrap();
+        let m: SystemMetrics = serde_json::from_value(fields).unwrap();
+        assert_eq!(m.logical_cores, 1);
     }
 }

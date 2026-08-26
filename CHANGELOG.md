@@ -5,6 +5,58 @@ the section matching the version you are running, alongside the commit and
 build time of the running binary, so "am I on the latest?" has an answer
 that does not depend on remembering what you installed.
 
+## Unreleased
+
+### CPU percentages say which percentage they are
+
+- Per-process `cpu_percent` is percent of **one core**, so a single-threaded
+  process saturating a thread reads `100` on a 32-core machine. Reported
+  bare, that reads as "consuming the whole machine" when it is about 3% of
+  it — and it repeatedly sent investigations after the wrong process,
+  including rMon itself three separate times.
+- Snapshots now carry `logical_cores`, and every reporting surface pairs the
+  per-core figure with a machine-relative one: `cpu_percent_of_machine` in
+  the MCP and Analyze tool output, `CPU%/core` column headers in the CLI,
+  TUI and GUI, and totals expressed as a share of the machine instead of a
+  number that runs past 100. MCP results carry a `cpu_units` note so the
+  convention travels with the data rather than living in a tool description.
+- Ranking is unchanged: dividing every process by the same core count
+  preserves the order. What changes is that the magnitude can now be read
+  correctly.
+
+### Orphan burners
+
+- New trend verdict: a process still burning at least half a core whose
+  parent has exited, so nothing is left that would notice or reap it. This
+  is the runaway-background-process shape — a search or build whose shell
+  died and that will spin until reboot.
+- Being orphaned is on its own completely ordinary (anything launched from a
+  closed shell qualifies), so it is reported as informational `orphaned` and
+  never flags on its own; the CPU thresholds carry the verdict. Orphan
+  burners sort above leak suspects, because they are wasting a core now
+  rather than creeping.
+
+### The WHEA scan is ~130x faster
+
+- Hardware-health checks read the System channel through `EvtQuery`
+  (`wevtapi`) instead of WMI's `Win32_NTLogEvent`. WMI cannot use the
+  channel's per-provider index, so it walked the log record by record and
+  its cost scaled with the *window*. Measured on a 30,138-record System log:
+
+  | lookback | `Win32_NTLogEvent` | `EvtQuery` |
+  |----------|-------------------:|-----------:|
+  | 7 days   |            ~870 ms |    ~130 ms |
+  | 30 days  |          ~6,690 ms |     ~47 ms |
+  | 365 days |         ~43,945 ms |     ~52 ms |
+
+- The default lookback rises from 7 days to **30**: the small window existed
+  only to limit the WMI cost, and `EvtQuery` is flat in lookback.
+- Reports carry `whea_query_ms`, so an expensive scan is attributable rather
+  than being blamed on whatever process happens to be on screen.
+- `Critical`-level entries now count toward `whea_error_count` alongside
+  `Error`, matching what a caller asking "did this machine report a hardware
+  fault" means.
+
 ## 0.2.0 — 2026-08-25
 
 ### Installed programs, provenance, and software diagnosis
