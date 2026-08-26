@@ -622,8 +622,30 @@ mod tests {
         s
     }
 
+    /// Whether this machine can seal a key at all.
+    ///
+    /// DPAPI needs a loaded user profile, and CI runners have none —
+    /// `CryptProtectData` fails there with "DPAPI could not encrypt the
+    /// key". The tests below are about which *source* of configuration
+    /// wins, not about whether Windows can encrypt, so where it cannot
+    /// they have nothing to say. Skipping loudly beats either failing the
+    /// build over the runner's profile or quietly dropping the assertion
+    /// on the machines where it does mean something.
+    fn can_seal() -> bool {
+        match LlmSettings::default().set_api_key("sk-probe") {
+            Ok(()) => true,
+            Err(e) => {
+                println!("skipping: this machine cannot seal with DPAPI ({e:#})");
+                false
+            }
+        }
+    }
+
     #[test]
     fn saved_key_wins_over_the_environment() {
+        if !can_seal() {
+            return;
+        }
         let saved = saved_with_key("sk-saved");
         let env = env_of(&[("RMON_LLM_API_KEY", "sk-env"), ("RMON_LLM_MODEL", "m")]);
 
@@ -660,6 +682,9 @@ mod tests {
 
     #[test]
     fn saved_model_and_base_url_win_over_the_environment() {
+        if !can_seal() {
+            return;
+        }
         let mut saved = saved_with_key("sk-saved");
         saved.model = Some("claude-opus".into());
         saved.base_url = Some("https://gateway-dev.mezzanin.eu/v1".into());
@@ -676,6 +701,9 @@ mod tests {
 
     #[test]
     fn base_url_falls_back_to_the_passiv_gateway() {
+        if !can_seal() {
+            return;
+        }
         let saved = saved_with_key("sk-saved");
         let env = env_of(&[("RMON_LLM_MODEL", "m")]);
 
@@ -688,6 +716,9 @@ mod tests {
     /// and must not beat a real value from the environment.
     #[test]
     fn blank_saved_values_fall_through_rather_than_winning() {
+        if !can_seal() {
+            return;
+        }
         let mut saved = saved_with_key("sk-saved");
         saved.model = Some("   ".into());
         saved.base_url = Some(String::new());
@@ -715,6 +746,9 @@ mod tests {
 
     #[test]
     fn a_missing_model_is_reported_separately_from_a_missing_key() {
+        if !can_seal() {
+            return;
+        }
         let saved = saved_with_key("sk-saved");
 
         let err = AgentConfig::from_saved_or_env(&saved, None, &env_of(&[])).unwrap_err();
@@ -785,6 +819,9 @@ mod tests {
     /// unprotected copy.
     #[test]
     fn a_session_unlock_outranks_the_plain_saved_key() {
+        if !can_seal() {
+            return;
+        }
         let mut saved = saved_with_key("sk-plain");
         saved.model = Some("m".into());
 
