@@ -205,7 +205,9 @@ pub fn analyze(history: &RollingHistory) -> Vec<ProcessTrend> {
             .cmp(&a.flagged())
             .then_with(|| {
                 let slope = |t: &ProcessTrend| t.handles.map(|s| s.slope_per_hour).unwrap_or(0.0);
-                slope(b).partial_cmp(&slope(a)).unwrap_or(std::cmp::Ordering::Equal)
+                slope(b)
+                    .partial_cmp(&slope(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| {
                 b.cpu_core_sec
@@ -302,10 +304,18 @@ mod tests {
         // +10 handles per minute for an hour -> 600/h.
         let values: Vec<f64> = (0..=60).map(|i| 1000.0 + 10.0 * i as f64).collect();
         let s = trend_stats(&series(&values, 60)).unwrap();
-        assert!((s.slope_per_hour - 600.0).abs() < 1.0, "slope {}", s.slope_per_hour);
+        assert!(
+            (s.slope_per_hour - 600.0).abs() < 1.0,
+            "slope {}",
+            s.slope_per_hour
+        );
         assert_eq!(s.monotonicity, 1.0);
         assert_eq!(s.net_change, 600.0);
-        assert!(is_leak(&s, HANDLE_LEAK_MIN_SLOPE_PER_HOUR, HANDLE_LEAK_MIN_NET));
+        assert!(is_leak(
+            &s,
+            HANDLE_LEAK_MIN_SLOPE_PER_HOUR,
+            HANDLE_LEAK_MIN_NET
+        ));
     }
 
     #[test]
@@ -316,7 +326,11 @@ mod tests {
             .collect();
         let s = trend_stats(&series(&values, 60)).unwrap();
         assert!(s.monotonicity < LEAK_MIN_MONOTONICITY);
-        assert!(!is_leak(&s, HANDLE_LEAK_MIN_SLOPE_PER_HOUR, HANDLE_LEAK_MIN_NET));
+        assert!(!is_leak(
+            &s,
+            HANDLE_LEAK_MIN_SLOPE_PER_HOUR,
+            HANDLE_LEAK_MIN_NET
+        ));
     }
 
     #[test]
@@ -325,7 +339,11 @@ mod tests {
         let values: Vec<f64> = (0..=10).map(|i| 1000.0 + 100.0 * i as f64).collect();
         let s = trend_stats(&series(&values, 60)).unwrap();
         assert!(s.slope_per_hour > HANDLE_LEAK_MIN_SLOPE_PER_HOUR);
-        assert!(!is_leak(&s, HANDLE_LEAK_MIN_SLOPE_PER_HOUR, HANDLE_LEAK_MIN_NET));
+        assert!(!is_leak(
+            &s,
+            HANDLE_LEAK_MIN_SLOPE_PER_HOUR,
+            HANDLE_LEAK_MIN_NET
+        ));
     }
 
     #[test]
@@ -338,8 +356,16 @@ mod tests {
         let s = trend_stats(&series(&values, 60)).unwrap();
         assert!(s.net_change >= HANDLE_LEAK_MIN_NET);
         assert!(s.monotonicity >= LEAK_MIN_MONOTONICITY);
-        assert!(s.recent_slope_per_hour.abs() < 1.0, "recent slope {}", s.recent_slope_per_hour);
-        assert!(!is_leak(&s, HANDLE_LEAK_MIN_SLOPE_PER_HOUR, HANDLE_LEAK_MIN_NET));
+        assert!(
+            s.recent_slope_per_hour.abs() < 1.0,
+            "recent slope {}",
+            s.recent_slope_per_hour
+        );
+        assert!(!is_leak(
+            &s,
+            HANDLE_LEAK_MIN_SLOPE_PER_HOUR,
+            HANDLE_LEAK_MIN_NET
+        ));
     }
 
     #[test]

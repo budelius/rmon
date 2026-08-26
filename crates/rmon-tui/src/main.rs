@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -11,13 +12,12 @@ use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, ListState, Row, Table,
     TableState,
 };
-use ratatui::Frame;
 use rmon_core::{
-    build_tree, check_hardware_health, list_all_ports, list_open_files, list_open_files_many,
-    listening_ports_for, merge_recent_exits, AllFilesEntry, GpuSource, HardwareHealthReport,
-    OpenFilesScan, PortEntry, ProcessSample, RollingHistory, Sampler, ShortLivedWatcher,
-    SystemMetrics, DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
-    DEFAULT_WHEA_MAX_EVENTS,
+    AllFilesEntry, DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
+    DEFAULT_WHEA_MAX_EVENTS, GpuSource, HardwareHealthReport, OpenFilesScan, PortEntry,
+    ProcessSample, RollingHistory, Sampler, ShortLivedWatcher, SystemMetrics, build_tree,
+    check_hardware_health, list_all_ports, list_open_files, list_open_files_many,
+    listening_ports_for, merge_recent_exits,
 };
 
 const RETAIN: Duration = Duration::from_secs(300);
@@ -57,7 +57,12 @@ impl SortWindow {
     }
 }
 
-fn score(history: &RollingHistory, metric: SortMetric, window: SortWindow, p: &ProcessSample) -> f32 {
+fn score(
+    history: &RollingHistory,
+    metric: SortMetric,
+    window: SortWindow,
+    p: &ProcessSample,
+) -> f32 {
     match window {
         SortWindow::Instant => match metric {
             SortMetric::Cpu => p.cpu_percent,
@@ -471,7 +476,11 @@ impl App {
             ViewMode::Flat => {
                 self.tree_ghosts.clear();
                 let mut v = filtered;
-                v.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_by(|a, b| {
+                    key(b)
+                        .partial_cmp(&key(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 v.into_iter().map(|p| (0, p)).collect()
             }
             ViewMode::Tree => {
@@ -480,7 +489,11 @@ impl App {
                 // ppid at the moment it started, so it survives the
                 // parent exiting) instead of promoting every orphan
                 // straight to a root.
-                let recent_exits = self.short_lived.as_ref().map(|w| w.recent()).unwrap_or_default();
+                let recent_exits = self
+                    .short_lived
+                    .as_ref()
+                    .map(|w| w.recent())
+                    .unwrap_or_default();
                 let (augmented, ghosts) =
                     merge_recent_exits(&filtered, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
                 self.tree_ghosts = ghosts;
@@ -692,7 +705,10 @@ fn handle_key_processes(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Char('H') => {
             app.app_view = AppView::Health;
             if app.health.is_none() {
-                app.health = Some(HealthState::start(DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS));
+                app.health = Some(HealthState::start(
+                    DEFAULT_WHEA_LOOKBACK_DAYS,
+                    DEFAULT_WHEA_MAX_EVENTS,
+                ));
             }
         }
         _ => {}
@@ -724,7 +740,10 @@ fn handle_key_health(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('r') => {
             if !app.health.as_ref().is_some_and(HealthState::scanning) {
-                app.health = Some(HealthState::start(DEFAULT_WHEA_LOOKBACK_DAYS, DEFAULT_WHEA_MAX_EVENTS));
+                app.health = Some(HealthState::start(
+                    DEFAULT_WHEA_LOOKBACK_DAYS,
+                    DEFAULT_WHEA_MAX_EVENTS,
+                ));
             }
         }
         _ => {}
@@ -745,7 +764,13 @@ fn handle_key_search(app: &mut App, code: KeyCode) -> bool {
         return true;
     }
     let names = build_name_map(&app.rows);
-    let len = search_matches(&app.ports, &app.search_all.files, &names, &app.search_all.query).len();
+    let len = search_matches(
+        &app.ports,
+        &app.search_all.files,
+        &names,
+        &app.search_all.query,
+    )
+    .len();
     match code {
         KeyCode::Char('q') => return false,
         KeyCode::Esc => app.app_view = AppView::Processes,
@@ -814,7 +839,9 @@ fn ui_health(f: &mut Frame, app: &App) {
 
     let title = Line::from(Span::styled(
         "Hardware health",
-        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
     ));
 
     let Some(health) = &app.health else {
@@ -887,8 +914,16 @@ fn ui_health(f: &mut Frame, app: &App) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!("WHEA events ({})", report.whea_events.len())))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("WHEA events ({})", report.whea_events.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     let mut state = health.list_state;
     f.render_stateful_widget(list, chunks[1], &mut state);
@@ -910,7 +945,9 @@ fn ui_search(f: &mut Frame, app: &App) {
 
     let title = Line::from(Span::styled(
         "Search all processes",
-        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
     ));
     let status = if app.search_all.scanning() {
         Line::from(Span::styled(
@@ -921,7 +958,10 @@ fn ui_search(f: &mut Frame, app: &App) {
             Style::default().fg(Color::Yellow),
         ))
     } else if app.search_all.total > 0 {
-        Line::from(format!("{} processes scanned for open files", app.search_all.total))
+        Line::from(format!(
+            "{} processes scanned for open files",
+            app.search_all.total
+        ))
     } else {
         Line::from(Span::styled(
             "press 'a' to scan open files across all processes (ports are already live)",
@@ -935,7 +975,10 @@ fn ui_search(f: &mut Frame, app: &App) {
             Span::styled("█", Style::default().fg(Color::Yellow)),
         ])
     } else if !app.search_all.query.is_empty() {
-        Line::from(format!("query: {}  (press / to edit)", app.search_all.query))
+        Line::from(format!(
+            "query: {}  (press / to edit)",
+            app.search_all.query
+        ))
     } else {
         Line::from(Span::styled(
             "press / to search by pid, process name, address, port, or file path",
@@ -948,12 +991,25 @@ fn ui_search(f: &mut Frame, app: &App) {
     );
 
     let names = build_name_map(&app.rows);
-    let matches = search_matches(&app.ports, &app.search_all.files, &names, &app.search_all.query);
+    let matches = search_matches(
+        &app.ports,
+        &app.search_all.files,
+        &names,
+        &app.search_all.query,
+    );
     let count = matches.len();
     let items: Vec<ListItem> = matches.into_iter().map(ListItem::new).collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!("Matches ({count})")))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Matches ({count})")),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     let mut state = app.search_all.list_state;
     f.render_stateful_widget(list, chunks[1], &mut state);
@@ -1003,7 +1059,9 @@ fn ui_files(f: &mut Frame, app: &App) {
     let title = Line::from(vec![
         Span::styled(
             "Open files",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
         ),
         Span::raw(format!(": {} ({})", fs.name, fs.pid)),
     ]);
@@ -1018,9 +1076,10 @@ fn ui_files(f: &mut Frame, app: &App) {
             scan.handles_seen,
             scan.timed_out
         )),
-        FilesStatus::Error(e) => {
-            Line::from(Span::styled(format!("error: {e}"), Style::default().fg(Color::Red)))
-        }
+        FilesStatus::Error(e) => Line::from(Span::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        )),
     };
     let search_line = if fs.search_active {
         Line::from(vec![
@@ -1044,13 +1103,18 @@ fn ui_files(f: &mut Frame, app: &App) {
     let items: Vec<ListItem> = fs.filtered_paths().into_iter().map(ListItem::new).collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Files"))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     let mut state = fs.list_state;
     f.render_stateful_widget(list, chunks[1], &mut state);
 
-    let footer = Line::from("↑/↓ j/k: scroll   /: search   r: rescan   Esc: back to processes   q: quit")
-        .style(Style::default().fg(Color::DarkGray));
+    let footer =
+        Line::from("↑/↓ j/k: scroll   /: search   r: rescan   Esc: back to processes   q: quit")
+            .style(Style::default().fg(Color::DarkGray));
     f.render_widget(ratatui::widgets::Paragraph::new(footer), chunks[2]);
 }
 
@@ -1074,7 +1138,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let line1 = Line::from(vec![
         Span::styled(
             "rMon",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
         ),
         Span::raw(format!(
             " — live process CPU/GPU monitor    view: {view_label}   sort: {} {}{}{}",
@@ -1102,7 +1168,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("search: ", Style::default().fg(Color::DarkGray)),
             Span::raw(&app.search),
-            Span::styled("  (press / to edit, Esc while editing clears)", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "  (press / to edit, Esc while editing clears)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])
     } else {
         Line::from(Span::styled(
@@ -1129,11 +1198,33 @@ fn thermal_line(app: &App) -> Line<'static> {
         .map(|r| format!("{:.0}% clock", r * 100.0))
         .unwrap_or_else(|| "clock n/a".to_string());
     spans.push(Span::raw(format!("CPU: {cpu_temp} {cpu_clock}")));
-    if app.system.cpu_throttled {
-        spans.push(Span::styled(
-            " [possibly throttled]",
+    if let Some(h) = app.system.cpu_thermal_headroom_c {
+        spans.push(Span::raw(format!(" {h:.0}°C to TjMax")));
+    }
+    // Measured and inferred throttling read differently on purpose: one
+    // is the CPU reporting its thermal control circuit is engaged, the
+    // other is a guess from low clocks.
+    match &app.system.cpu_throttle_reason {
+        Some(reason) if app.system.cpu_throttle_confirmed => spans.push(Span::styled(
+            format!(" [THROTTLED: {reason}]"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Some(reason) => spans.push(Span::styled(
+            format!(" [likely throttled: {reason}]"),
             Style::default().fg(Color::Yellow),
-        ));
+        )),
+        None if app.system.cpu_thermal_throttled_since_boot => spans.push(Span::styled(
+            " [has throttled since boot]",
+            Style::default().fg(Color::DarkGray),
+        )),
+        None => {}
+    }
+    for fan in app.system.fans.iter().filter(|f| f.rpm.is_some()) {
+        spans.push(Span::raw(format!(
+            "   {}: {} rpm",
+            fan.label,
+            fan.rpm.unwrap_or(0)
+        )));
     }
     for gpu in &app.system.gpus {
         let temp = gpu
@@ -1182,7 +1273,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
 
         let indent = "  ".repeat(*depth);
         let marker = if is_ghost { " 👻 exited" } else { "" };
-        let name = format!("{indent}{}{}{marker}", if *depth > 0 { "└ " } else { "" }, p.name);
+        let name = format!(
+            "{indent}{}{}{marker}",
+            if *depth > 0 { "└ " } else { "" },
+            p.name
+        );
 
         let row = Row::new(vec![
             Cell::from(p.pid.to_string()),
@@ -1209,7 +1304,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title("Processes"))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
 
     let mut state = app.table_state;
@@ -1296,19 +1395,13 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             Axis::default()
                 .title("seconds ago")
                 .bounds([0.0, max_x])
-                .labels(vec![
-                    Line::from("0"),
-                    Line::from(format!("{max_x:.0}")),
-                ]),
+                .labels(vec![Line::from("0"), Line::from(format!("{max_x:.0}"))]),
         )
         .y_axis(
             Axis::default()
                 .title("%")
                 .bounds([0.0, max_y])
-                .labels(vec![
-                    Line::from("0"),
-                    Line::from(format!("{max_y:.0}")),
-                ]),
+                .labels(vec![Line::from("0"), Line::from(format!("{max_y:.0}"))]),
         );
 
     f.render_widget(chart, area);
@@ -1318,7 +1411,14 @@ fn draw_ports_panel(f: &mut Frame, app: &App, pid: u32, area: Rect) {
     let ports = listening_ports_for(&app.ports, pid);
     let items: Vec<ListItem> = ports
         .iter()
-        .map(|p| ListItem::new(format!("{:<3} {}:{}", p.protocol.as_str(), p.local_addr, p.local_port)))
+        .map(|p| {
+            ListItem::new(format!(
+                "{:<3} {}:{}",
+                p.protocol.as_str(),
+                p.local_addr,
+                p.local_port
+            ))
+        })
         .collect();
     let list = List::new(items).block(
         Block::default()

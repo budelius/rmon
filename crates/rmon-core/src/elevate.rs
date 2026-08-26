@@ -9,13 +9,13 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 
-use anyhow::{bail, Result};
-use windows::core::PCWSTR;
+use anyhow::{Result, bail};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::PCWSTR;
 
 /// True if the current process is running with an elevated (Administrator) token.
 pub fn is_elevated() -> bool {

@@ -28,13 +28,12 @@ use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::transport::stdio;
-use rmcp::{schemars, tool, tool_router, ErrorData as McpError, ServiceExt};
+use rmcp::{ErrorData as McpError, ServiceExt, schemars, tool, tool_router};
 use rmon_core::{
-    build_tree, check_hardware_health, handle_count, list_all_ports, list_open_files,
-    list_open_files_many, listening_ports_for, merge_recent_exits, trends, PortEntry,
-    ProcessSample, RollingHistory, Sampler, ShortLivedWatcher, Snapshot, SystemMetrics,
     DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
-    DEFAULT_WHEA_MAX_EVENTS,
+    DEFAULT_WHEA_MAX_EVENTS, PortEntry, ProcessSample, RollingHistory, Sampler, ShortLivedWatcher,
+    Snapshot, SystemMetrics, build_tree, check_hardware_health, handle_count, list_all_ports,
+    list_open_files, list_open_files_many, listening_ports_for, merge_recent_exits, trends,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -104,7 +103,28 @@ fn system_json(s: &SystemMetrics) -> serde_json::Value {
         "cpu_temp_c": s.cpu_temp_c,
         "cpu_temp_source": s.cpu_temp_source,
         "cpu_clock_ratio": s.cpu_clock_ratio,
+        "cpu_thermal_headroom_c": s.cpu_thermal_headroom_c,
         "cpu_throttled": s.cpu_throttled,
+        "cpu_throttle_reason": s.cpu_throttle_reason,
+        // Whether the throttle verdict was read from the CPU or inferred
+        // from clock speed. An agent acting on this needs to know which:
+        // the first is a fact, the second is a guess that a busy but
+        // healthy machine can also produce.
+        "cpu_throttle_confirmed": s.cpu_throttle_confirmed,
+        "cpu_thermal_throttled_since_boot": s.cpu_thermal_throttled_since_boot,
+        "sensor_source": s.sensor_source,
+        "fans": s.fans.iter().map(|f| json!({
+            "label": f.label,
+            "rpm": f.rpm,
+        })).collect::<Vec<_>>(),
+        "board_temperatures": s.board_temperatures.iter().map(|t| json!({
+            "label": t.label,
+            "temp_c": t.temp_c,
+        })).collect::<Vec<_>>(),
+        "voltages": s.voltages.iter().map(|v| json!({
+            "label": v.label,
+            "volts": v.volts,
+        })).collect::<Vec<_>>(),
         "gpus": s.gpus.iter().map(|g| json!({
             "index": g.index,
             "name": g.name,
@@ -246,7 +266,12 @@ impl RmonMcpServer {
             Ok(w) => (Some(Arc::new(w)), None),
             Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
         };
-        Self { tx, history, short_lived, short_lived_error }
+        Self {
+            tx,
+            history,
+            short_lived,
+            short_lived_error,
+        }
     }
 
     /// Takes a fresh sample from the dedicated sampler thread. CPU%/GPU% on
@@ -293,7 +318,11 @@ impl RmonMcpServer {
         Parameters(args): Parameters<TreeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let snap = self.snapshot_now().await;
-        let recent_exits = self.short_lived.as_ref().map(|w| w.recent()).unwrap_or_default();
+        let recent_exits = self
+            .short_lived
+            .as_ref()
+            .map(|w| w.recent())
+            .unwrap_or_default();
         let (augmented, ghosts) =
             merge_recent_exits(&snap.processes, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
         let key = |p: &ProcessSample| p.cpu_percent + p.gpu_percent;
@@ -353,14 +382,20 @@ impl RmonMcpServer {
         Parameters(args): Parameters<ProcessDetailArgs>,
     ) -> Result<CallToolResult, McpError> {
         let snap = self.snapshot_now().await;
-        let info = snap.processes.iter().find(|p| p.pid == args.pid).map(process_json);
+        let info = snap
+            .processes
+            .iter()
+            .find(|p| p.pid == args.pid)
+            .map(process_json);
         let handles = handle_count(args.pid);
 
         let files = if args.include_files {
             let pid = args.pid;
-            let result = tokio::task::spawn_blocking(move || list_open_files(pid).map_err(|e| e.to_string()))
-                .await
-                .map_err(to_mcp_err)?;
+            let result = tokio::task::spawn_blocking(move || {
+                list_open_files(pid).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(to_mcp_err)?;
             Some(match result {
                 Ok(scan) => json!({
                     "paths": scan.paths,
@@ -392,7 +427,9 @@ impl RmonMcpServer {
 
         let trend = {
             let history = self.history.lock().expect("history mutex poisoned");
-            trends::analyze(&history).into_iter().find(|t| t.pid == args.pid)
+            trends::analyze(&history)
+                .into_iter()
+                .find(|t| t.pid == args.pid)
         };
 
         text_result(&json!({
@@ -453,9 +490,15 @@ impl RmonMcpServer {
         if let Some(f) = &args.filter {
             let f = f.to_lowercase();
             ports.retain(|p| {
-                format!("{} {}:{} {}", p.pid, p.local_addr, p.local_port, p.protocol.as_str())
-                    .to_lowercase()
-                    .contains(&f)
+                format!(
+                    "{} {}:{} {}",
+                    p.pid,
+                    p.local_addr,
+                    p.local_port,
+                    p.protocol.as_str()
+                )
+                .to_lowercase()
+                .contains(&f)
             });
         }
         text_result(&json!(ports.iter().map(port_json).collect::<Vec<_>>()))
@@ -469,8 +512,11 @@ impl RmonMcpServer {
         Parameters(args): Parameters<SearchFilesArgs>,
     ) -> Result<CallToolResult, McpError> {
         let snap = self.snapshot_now().await;
-        let names: HashMap<u32, String> =
-            snap.processes.iter().map(|p| (p.pid, p.name.clone())).collect();
+        let names: HashMap<u32, String> = snap
+            .processes
+            .iter()
+            .map(|p| (p.pid, p.name.clone()))
+            .collect();
         let pids: Vec<u32> = snap.processes.iter().map(|p| p.pid).collect();
         let total = pids.len();
         let query = args.query.to_lowercase();
@@ -509,7 +555,7 @@ impl RmonMcpServer {
     }
 
     #[tool(
-        description = "System-wide thermal and GPU telemetry: CPU temperature/clock ratio/throttle heuristic, and per-GPU temperature and throttle status (NVIDIA only, via NVML)."
+        description = "System-wide hardware telemetry: CPU temperature, distance to TjMax, clock ratio, and throttle state (read from the CPU's own thermal status register when PawnIO is available and rMon is elevated — `cpu_throttle_confirmed` says which), motherboard temperatures, voltages and fan RPM from rMon's direct SensorHub, and per-GPU temperature and throttle status (NVIDIA only, via NVML)."
     )]
     async fn system_metrics(&self) -> Result<CallToolResult, McpError> {
         let snap = self.snapshot_now().await;

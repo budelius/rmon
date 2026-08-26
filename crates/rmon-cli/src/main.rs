@@ -1,20 +1,23 @@
 mod mcp;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rmon_core::{
-    build_tree, check_hardware_health, list_all_ports, list_open_files, list_open_files_many,
-    GpuSource, PortEntry, ProcessSample, Sampler, Snapshot, Store, SystemMetrics,
-    DEFAULT_SCAN_WORKERS,
+    DEFAULT_SCAN_WORKERS, GpuSource, PortEntry, ProcessSample, Sampler, Snapshot, Store,
+    SystemMetrics, build_tree, check_hardware_health, list_all_ports, list_open_files,
+    list_open_files_many,
 };
 
 #[derive(Parser)]
-#[command(name = "rmon", about = "rMon: see what process is using your CPU and GPU")]
+#[command(
+    name = "rmon",
+    about = "rMon: see what process is using your CPU and GPU"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -91,6 +94,21 @@ enum Command {
         #[arg(long, default_value_t = rmon_core::DEFAULT_WHEA_MAX_EVENTS)]
         max_events: usize,
     },
+    /// Report what rMon can read directly from the hardware: CPU thermal
+    /// MSRs plus motherboard temperatures, voltages, and fan tachometers,
+    /// via the PawnIO driver.
+    ///
+    /// Needs PawnIO installed (<https://pawnio.eu>) and Administrator. Without
+    /// either, it prints which of the two is missing and what the fallback
+    /// sources can still see, rather than failing.
+    Sensors {
+        /// Also dump raw Super I/O register bytes and probe both
+        /// configuration ports. Use when fan readings look implausible:
+        /// it distinguishes a chip that isn't answering from one whose
+        /// register map rMon has wrong.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -108,10 +126,15 @@ fn main() -> Result<()> {
             duration_secs,
         } => run_record(db, csv, interval_ms, duration_secs),
         Command::Files { pid, filter } => run_files(pid, filter),
-        Command::Ports { pid, listening, filter } => run_ports(pid, listening, filter),
+        Command::Ports {
+            pid,
+            listening,
+            filter,
+        } => run_ports(pid, listening, filter),
         Command::Search { query, ports_only } => run_search(query, ports_only),
         Command::Mcp => mcp::run(),
         Command::Health { days, max_events } => run_health(days, max_events),
+        Command::Sensors { raw } => run_sensors(raw),
     };
     if let Err(err) = &result {
         rmon_core::observability::capture_anyhow(err);
@@ -151,7 +174,10 @@ fn run_ports(pid: Option<u32>, listening: bool, filter: Option<String>) -> Resul
     }
     let filter = filter.map(|f| f.to_lowercase());
 
-    println!("{:<5} {:<24} {:<24} {:<8} PID", "PROTO", "LOCAL", "REMOTE", "STATE");
+    println!(
+        "{:<5} {:<24} {:<24} {:<8} PID",
+        "PROTO", "LOCAL", "REMOTE", "STATE"
+    );
     let mut shown = 0usize;
     for p in &ports {
         let local = format!("{}:{}", p.local_addr, p.local_port);
@@ -166,7 +192,11 @@ fn run_ports(pid: Option<u32>, listening: bool, filter: Option<String>) -> Resul
                 continue;
             }
         }
-        println!("{:<5} {local:<24} {remote:<24} {state:<8} {}", p.protocol.as_str(), p.pid);
+        println!(
+            "{:<5} {local:<24} {remote:<24} {state:<8} {}",
+            p.protocol.as_str(),
+            p.pid
+        );
         shown += 1;
     }
     println!("\n{shown} of {} endpoint(s) shown", ports.len());
@@ -241,6 +271,187 @@ fn run_search(query: String, ports_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// Dumps the direct-hardware sensor path's own view of the machine.
+///
+/// Deliberately separate from `snapshot`, which reports whichever source
+/// won: this one answers "is the kernel path working, and what exactly is
+/// it giving me", which is the question when setting it up or checking a
+/// reading against another tool.
+fn run_sensors(raw: bool) -> Result<()> {
+    let elevated = rmon_core::elevate::is_elevated();
+    let mut hub = rmon_core::SensorHub::new();
+
+    println!("{}", hub.status_line());
+    if !elevated {
+        println!("(rMon is not running as Administrator — the kernel driver cannot be opened)");
+    }
+    println!();
+
+    match hub.cpu_package() {
+        Some(p) => {
+            println!("CPU package temperature: {:.0}°C", p.temp_c);
+            println!("  TjMax:                 {:.0}°C", p.tjmax_c);
+            println!("  headroom:              {:.0}°C below TjMax", p.headroom_c);
+            println!("  thermal throttling:    {}", yes_no(p.thermal_throttling));
+            println!("  PROCHOT# asserted:     {}", yes_no(p.prochot));
+            println!("  critical temperature:  {}", yes_no(p.critical));
+            println!("  power limited:         {}", yes_no(p.power_limited));
+            // Sticky bits: history, not current state. Labelled as such so
+            // a set flag on an idle machine isn't read as an active alarm.
+            println!(
+                "  thermal throttled at least once since boot: {}",
+                yes_no(p.thermal_since_boot)
+            );
+            println!(
+                "  power limited at least once since boot:     {}",
+                yes_no(p.power_limited_since_boot)
+            );
+            match p.limit_reason() {
+                Some(r) => println!("  currently limited: {r}"),
+                None => println!("  currently limited: no"),
+            }
+        }
+        None => println!("CPU thermal MSRs: unavailable"),
+    }
+
+    println!();
+    let chips = hub.chips();
+    if chips.is_empty() {
+        println!(
+            "Super I/O: {}",
+            hub.superio_error().unwrap_or("no chip found")
+        );
+    }
+    for c in chips {
+        println!(
+            "Super I/O: {} (id {:#04x} rev {:#04x}) on port {:#06x}, {} fan channel(s){}",
+            c.name,
+            c.id,
+            c.revision,
+            c.register_port,
+            c.fan_count,
+            if c.family.fans_supported() {
+                ""
+            } else {
+                " - not decoded by rMon"
+            }
+        );
+    }
+    let fans = hub.fans();
+    if fans.is_empty() {
+        println!("no fan tachometers available");
+    }
+    for f in fans {
+        match f.rpm {
+            Some(rpm) => println!("  {}: {rpm} rpm", f.label),
+            None => println!("  {}: no fan connected", f.label),
+        }
+    }
+
+    println!();
+    println!("Motherboard temperatures:");
+    let temperatures = hub.board_temperatures();
+    if temperatures.is_empty() {
+        println!("  unavailable");
+    }
+    for reading in temperatures {
+        match reading.temp_c {
+            Some(temp_c) => println!("  {}: {temp_c:.1}°C", reading.label),
+            None => println!("  {}: unconnected/unavailable", reading.label),
+        }
+    }
+
+    println!();
+    println!("Voltages:");
+    let voltages = hub.voltages();
+    if voltages.is_empty() {
+        println!("  unavailable");
+    }
+    for reading in voltages {
+        match reading.volts {
+            Some(volts) => println!("  {}: {volts:.3} V", reading.label),
+            None => println!("  {}: unavailable", reading.label),
+        }
+    }
+    if voltages
+        .iter()
+        .any(|reading| reading.label.contains("ADC pin"))
+    {
+        println!(
+            "  note: VIN values are ADC pin voltages; motherboard-specific +5V/+12V divider scaling is not guessed"
+        );
+    }
+
+    if raw {
+        print_raw_diagnostics(&hub);
+    }
+
+    println!();
+    println!("Optional: cross-check unfamiliar channels against firmware or HWiNFO.");
+    Ok(())
+}
+
+/// Raw Super I/O bytes plus what each configuration port answered.
+///
+/// The vendor ID is the load-bearing line: reading 0x5CA3 back through the
+/// same banked path the fan registers use proves the base address and bank
+/// switching are right, which means implausible fan numbers are a wrong
+/// register map. All-0xFF means the block isn't answering at all.
+fn print_raw_diagnostics(hub: &rmon_core::SensorHub) {
+    println!();
+    println!("--- raw diagnostics ---");
+
+    match rmon_core::sensors::probe_slots() {
+        Ok(probes) => {
+            for p in probes {
+                println!(
+                    "  port {:#06x}: id {:#04x} rev {:#04x} -> {}",
+                    p.register_port,
+                    p.id,
+                    p.revision,
+                    p.recognised
+                        .as_deref()
+                        .unwrap_or("not in rMon's chip table")
+                );
+            }
+        }
+        Err(e) => println!("  slot probe failed: {}", e.message()),
+    }
+
+    let dumps = hub.raw_dump();
+    if dumps.is_empty() {
+        println!("  no Super I/O chip to dump");
+    }
+    for d in dumps {
+        println!();
+        println!("  {} at base {:#06x} ({:?})", d.chip, d.hm_base, d.family);
+        if let Some(vendor_id) = d.vendor_id {
+            println!(
+                "    vendor id: {vendor_id:#06x} ({})",
+                if d.vendor_id_ok() {
+                    "correct - banked reads are working"
+                } else {
+                    "WRONG - expected 0x5ca3, so the block is not answering"
+                }
+            );
+        }
+        if let Some(e) = &d.error {
+            println!("    dump failed: {e}");
+        }
+        for (reg, high, low) in &d.registers {
+            let counter = ((*high as u32) << 5) | (*low as u32 & 0x1F);
+            let direct = ((*high as u32) << 8) | *low as u32;
+            println!(
+                "    {reg:#05x}: {high:#04x} {low:#04x}  as-counter={counter} as-rpm={direct}"
+            );
+        }
+    }
+}
+
+fn yes_no(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
+}
+
 fn run_health(days: i64, max_events: usize) -> Result<()> {
     let report = check_hardware_health(days, max_events);
 
@@ -293,7 +504,9 @@ fn run_health(days: i64, max_events: usize) -> Result<()> {
 fn run_snapshot(top: usize, tree: bool, subtree: bool) -> Result<()> {
     let mut sampler = Sampler::new();
     if !sampler.has_gpu_source() {
-        eprintln!("warning: no GPU data source available (no NVIDIA driver and no 'GPU Engine' perf counters); GPU column will read 0.0");
+        eprintln!(
+            "warning: no GPU data source available (no NVIDIA driver and no 'GPU Engine' perf counters); GPU column will read 0.0"
+        );
     }
 
     // CPU/GPU percentages are deltas since the last sample, so the very
@@ -380,14 +593,22 @@ fn thermal_summary(system: &SystemMetrics) -> String {
         .cpu_clock_ratio
         .map(|r| format!("{:.0}% clock", r * 100.0))
         .unwrap_or_else(|| "clock n/a".to_string());
-    let throttle = if system.cpu_throttled { " [possibly throttled]" } else { "" };
+    let throttle = match &system.cpu_throttle_reason {
+        Some(reason) if system.cpu_throttle_confirmed => format!(" [THROTTLED: {reason}]"),
+        Some(reason) => format!(" [likely throttled: {reason}]"),
+        None => String::new(),
+    };
     let mut out = format!("CPU: {cpu_temp} {cpu_clock}{throttle}");
     for gpu in &system.gpus {
         let temp = gpu
             .temp_c
             .map(|t| format!("{t:.0}°C"))
             .unwrap_or_else(|| "n/a".to_string());
-        let throttle = if gpu.thermal_throttled { " [THERMAL THROTTLE]" } else { "" };
+        let throttle = if gpu.thermal_throttled {
+            " [THERMAL THROTTLE]"
+        } else {
+            ""
+        };
         out.push_str(&format!("   {}: {temp}{throttle}", gpu.name));
     }
     out

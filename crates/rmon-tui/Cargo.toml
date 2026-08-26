@@ -13,4 +13,4 @@ anyhow = "1.0.104"
 chrono = "0.4.45"
 crossterm = "0.29.0"
 ratatui = "0.30.2"
-rmon-core = { version = "0.1.0", path = "../rmon-core" }
+rmon-core = { version = "0.2.0", path = "../rmon-core" }

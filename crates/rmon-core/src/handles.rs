@@ -27,19 +27,19 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+use anyhow::{Context, Result, bail};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
     SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessHandleCount, OpenProcess, OpenProcessToken, TerminateProcess,
-    PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    GetCurrentProcess, GetProcessHandleCount, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    TerminateProcess,
 };
+use windows::core::PCWSTR;
 
 const PROCESS_HANDLE_INFORMATION_CLASS: u32 = 51; // ProcessHandleInformation
 const OBJECT_NAME_INFORMATION_CLASS: u32 = 1; // ObjectNameInformation
@@ -72,7 +72,9 @@ pub fn kill_process(pid: u32) -> Result<()> {
     enable_debug_privilege();
     unsafe {
         let process = OpenProcess(PROCESS_TERMINATE, false, pid).with_context(|| {
-            format!("OpenProcess({pid}, PROCESS_TERMINATE) failed — try running rMon as Administrator")
+            format!(
+                "OpenProcess({pid}, PROCESS_TERMINATE) failed — try running rMon as Administrator"
+            )
         })?;
         let result = TerminateProcess(process, 1).context("TerminateProcess failed");
         let _ = CloseHandle(process);
@@ -117,12 +119,13 @@ struct ProcessHandleTableEntryInfo {
 pub fn list_open_files(pid: u32) -> Result<OpenFilesScan> {
     enable_debug_privilege();
 
-    let process = unsafe {
-        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, false, pid)
-    }
-    .with_context(|| {
-        format!("OpenProcess({pid}) failed — try running rMon as Administrator for full access")
-    })?;
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, false, pid) }
+            .with_context(|| {
+                format!(
+                    "OpenProcess({pid}) failed — try running rMon as Administrator for full access"
+                )
+            })?;
 
     let entries = unsafe { query_process_handles(process) };
     let result = (|| -> Result<OpenFilesScan> {
@@ -136,7 +139,9 @@ pub fn list_open_files(pid: u32) -> Result<OpenFilesScan> {
         for entry in &entries {
             let type_name = type_names
                 .entry(entry.object_type_index)
-                .or_insert_with(|| unsafe { duplicate_and_query_type(process, entry.handle_value) });
+                .or_insert_with(|| unsafe {
+                    duplicate_and_query_type(process, entry.handle_value)
+                });
             if type_name.as_deref() != Some("File") {
                 continue;
             }
@@ -306,7 +311,9 @@ unsafe fn query_process_handles(process: HANDLE) -> Result<Vec<ProcessHandleTabl
                 break;
             }
             let entry = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const ProcessHandleTableEntryInfo)
+                std::ptr::read_unaligned(
+                    buf.as_ptr().add(offset) as *const ProcessHandleTableEntryInfo
+                )
             };
             out.push(entry);
         }
@@ -318,13 +325,22 @@ unsafe fn duplicate_and_query_type(process: HANDLE, handle_value: HANDLE) -> Opt
     let current = unsafe { GetCurrentProcess() };
     let mut dup = HANDLE::default();
     unsafe {
-        DuplicateHandle(process, handle_value, current, &mut dup, 0, false, DUPLICATE_SAME_ACCESS)
+        DuplicateHandle(
+            process,
+            handle_value,
+            current,
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
     }
     .ok()?;
 
     let mut buf = vec![0u8; 1024];
     let mut ret_len = 0u32;
-    let status = unsafe { nt_query_object(dup, OBJECT_TYPE_INFORMATION_CLASS, &mut buf, &mut ret_len) };
+    let status =
+        unsafe { nt_query_object(dup, OBJECT_TYPE_INFORMATION_CLASS, &mut buf, &mut ret_len) };
     let result = if status >= 0 {
         unsafe { read_unicode_string_at(&buf, 0) }
     } else {
@@ -339,11 +355,22 @@ unsafe fn duplicate_and_query_type(process: HANDLE, handle_value: HANDLE) -> Opt
 /// `Some(Some(path))` — resolved. `Some(None)` — duplicate/query failed
 /// outright (not a hang). `None` — timed out; the query thread is
 /// abandoned rather than joined.
-unsafe fn duplicate_and_query_name_with_timeout(process: HANDLE, handle_value: HANDLE) -> Option<Option<String>> {
+unsafe fn duplicate_and_query_name_with_timeout(
+    process: HANDLE,
+    handle_value: HANDLE,
+) -> Option<Option<String>> {
     let current = unsafe { GetCurrentProcess() };
     let mut dup = HANDLE::default();
     if unsafe {
-        DuplicateHandle(process, handle_value, current, &mut dup, 0, false, DUPLICATE_SAME_ACCESS)
+        DuplicateHandle(
+            process,
+            handle_value,
+            current,
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
     }
     .is_err()
     {
@@ -356,7 +383,8 @@ unsafe fn duplicate_and_query_name_with_timeout(process: HANDLE, handle_value: H
         let dup = HANDLE(dup_raw as *mut c_void);
         let mut buf = vec![0u8; 8192];
         let mut ret_len = 0u32;
-        let status = unsafe { nt_query_object(dup, OBJECT_NAME_INFORMATION_CLASS, &mut buf, &mut ret_len) };
+        let status =
+            unsafe { nt_query_object(dup, OBJECT_NAME_INFORMATION_CLASS, &mut buf, &mut ret_len) };
         let result = if status >= 0 {
             unsafe { read_unicode_string_at(&buf, 0) }
         } else {
@@ -390,7 +418,8 @@ pub(crate) unsafe fn read_unicode_string_at(buf: &[u8], offset: usize) -> Option
         return None; // kernel-written pointer/length didn't land inside our buffer; don't trust it
     }
     let byte_offset = ptr - base;
-    let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(byte_offset) as *const u16, len / 2) };
+    let slice =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr().add(byte_offset) as *const u16, len / 2) };
     Some(String::from_utf16_lossy(slice))
 }
 

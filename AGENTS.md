@@ -5,6 +5,8 @@
 rMon is a Windows-only Rust workspace for process CPU/GPU monitoring. Keep shared sampling and OS integration in `rmon-core`; the CLI, TUI, and GUI should consume that shared API rather than duplicating Win32 logic.
 
 - `crates/rmon-core`: sampling, process trees, history, storage, ports/files, telemetry, and observability
+  - `pawnio.rs` + `sensors/`: kernel-level hardware access (CPU thermal MSRs, Super I/O fan tachometers) through the PawnIO driver, with vendored signed module blobs in `vendor/pawnio/`
+- `crates/rmon-agent`: LLM agent core (OpenAI-compatible transport, read-only tools over `rmon-core`, approval-gated actions)
 - `crates/rmon-cli`: `rmon` commands and the stdio MCP server
 - `crates/rmon-tui`: ratatui dashboard
 - `crates/rmon-gui`: egui dashboard, tray/autostart support, and WiX installer source
@@ -35,6 +37,13 @@ cargo run -p rmon-cli -- mcp
 - The MCP server uses stdout exclusively for JSON-RPC framing. Never print diagnostics or progress to stdout while serving MCP; use stderr/logging.
 - WMI/COM-backed sampler state is thread-affine. Do not move sampling between arbitrary async worker threads.
 - Keep GUI/TUI sampling work off rendering/input paths when it can block.
+- Kernel-backed sensors are strictly optional. rMon never installs the PawnIO driver and must degrade to the HWiNFO/ACPI fallbacks (and say so) when it is absent, when rMon isn't elevated, or when the hardware isn't recognised.
+- Do not rebuild or substitute the blobs in `vendor/pawnio/`: the driver only accepts modules carrying the upstream signature. Update them by re-vendoring a PawnIO.Modules release and bumping `MODULES_VERSION`.
+- Super I/O access must hold the `Access_ISABUS.HTP.Method` mutex, and skip the read rather than block when another tool holds it. Adding fan *writes* means also handling the conflict with a running FanControl and restoring the initial PWM state on exit.
+- Keep measured and inferred throttling distinguishable all the way to the UI (`cpu_throttle_confirmed`); never render a heuristic guess with the same words as a hardware-reported fact.
+- The analysis agent must stay unable to change the machine. `propose_kill_process` returns a proposal; the kill runs from the UI's button handler only. Do not add a tool that mutates state without an explicit human approval step, and keep telling the model that nothing was executed.
+- Tool output must preserve the "measured zero" vs "could not measure" distinction as `null`. A model handed a fabricated zero will rule out causes it has no evidence about.
+- LLM credentials come from the environment only (`RMON_LLM_API_KEY`/`OPENAI_API_KEY`). Never persist them to the store, config, or logs.
 - Observability is environment-driven and must remain a no-op when its variables are unset. See `crates/rmon-core/OBSERVABILITY.md`.
 - Do not commit `target/`, SQLite/CSV runtime output, or `hook_outputs/`.
 

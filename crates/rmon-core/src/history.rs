@@ -174,8 +174,9 @@ impl RollingHistory {
         let Some(dq) = self.accum.get(&pid) else {
             return (0.0, 0.0);
         };
-        dq.iter()
-            .fold((0.0, 0.0), |(c, g), b| (c + b.cpu_pct_sec, g + b.gpu_pct_sec))
+        dq.iter().fold((0.0, 0.0), |(c, g), b| {
+            (c + b.cpu_pct_sec, g + b.gpu_pct_sec)
+        })
     }
 
     /// Open-handle-count series for a pid over the long accumulation window
@@ -199,7 +200,9 @@ impl RollingHistory {
         let Some(dq) = self.accum.get(&pid) else {
             return Vec::new();
         };
-        dq.iter().filter_map(|b| value(b).map(|v| (b.start, v))).collect()
+        dq.iter()
+            .filter_map(|b| value(b).map(|v| (b.start, v)))
+            .collect()
     }
 
     /// How much of the (up to `ACCUM_RETAIN`) accumulation window is
@@ -279,7 +282,13 @@ mod tests {
         let mut h = RollingHistory::new(Duration::from_secs(300));
         let t0 = Utc::now() - chrono::Duration::seconds(180);
         for i in 0..3 {
-            h.push(snapshot(t0 + chrono::Duration::seconds(60 * i), 1, "a.exe", 100 + i as u32, 50.0));
+            h.push(snapshot(
+                t0 + chrono::Duration::seconds(60 * i),
+                1,
+                "a.exe",
+                100 + i as u32,
+                50.0,
+            ));
         }
         let series = h.handle_series(1);
         assert_eq!(series.len(), 3);
@@ -291,13 +300,25 @@ mod tests {
         let mut h = RollingHistory::new(Duration::from_secs(300));
         let t0 = Utc::now() - chrono::Duration::seconds(180);
         h.push(snapshot(t0, 1, "a.exe", 5000, 50.0));
-        h.push(snapshot(t0 + chrono::Duration::seconds(60), 1, "a.exe", 6000, 50.0));
+        h.push(snapshot(
+            t0 + chrono::Duration::seconds(60),
+            1,
+            "a.exe",
+            6000,
+            50.0,
+        ));
         let (cpu_before, _) = h.accumulated(1);
         assert!(cpu_before > 0.0);
 
         // Same pid comes back as a different (idle) executable — the old
         // process's accumulated CPU must not be attributed to it.
-        h.push(snapshot(t0 + chrono::Duration::seconds(120), 1, "b.exe", 10, 0.0));
+        h.push(snapshot(
+            t0 + chrono::Duration::seconds(120),
+            1,
+            "b.exe",
+            10,
+            0.0,
+        ));
         let (cpu_after, _) = h.accumulated(1);
         assert_eq!(cpu_after, 0.0);
         let series = h.handle_series(1);

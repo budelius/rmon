@@ -11,13 +11,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::KernelTrace;
-use ferrisetw::EventRecord;
 
 const KERNEL_PROCESS_PROVIDER_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
 const EVENT_ID_PROCESS_START: u16 = 1;
@@ -78,9 +78,7 @@ impl ShortLivedWatcher {
             .enable(provider)
             .start_and_process()
             .map_err(|e| {
-                anyhow!(
-                    "failed to start Kernel-Process ETW trace (requires Administrator): {e:?}"
-                )
+                anyhow!("failed to start Kernel-Process ETW trace (requires Administrator): {e:?}")
             })?;
 
         Ok(Self {

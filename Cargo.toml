@@ -2,13 +2,14 @@
 resolver = "2"
 members = [
     "crates/rmon-core",
+    "crates/rmon-agent",
     "crates/rmon-cli",
     "crates/rmon-tui",
     "crates/rmon-gui",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 

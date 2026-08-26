@@ -20,8 +20,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use winreg::enums::HKEY_LOCAL_MACHINE;
 use winreg::RegKey;
+use winreg::enums::HKEY_LOCAL_MACHINE;
 use wmi::{WMIConnection, WMIDateTime};
 
 /// Kept modest because `Win32_NTLogEvent` (the only way to read the event

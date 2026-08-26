@@ -66,6 +66,15 @@ ranked list and a parent/child process tree. Both also have a live
 substring search box and a header line with CPU/GPU temperature and
 throttle status (see below).
 
+The GUI's left column is a tab strip — **processes · suspects · analyze ·
+sensors · health · exited · search · what's new · settings** — so every view is one click from
+every other. (These were previously buried in the App menu, each opening a
+panel with its own "back" button, which meant the only route from one view
+to another ran through the process table.) The suspects tab shows its count
+in the tab label when anything is flagged, so it can become urgent while
+you're looking at something else. The sort/filter toolbar is specific to
+the process table and hides on the other tabs.
+
 ### Sorting
 
 Two independent axes, both available in the CLI (`--tree`/`--subtree`), TUI
@@ -91,8 +100,11 @@ of, not instead of, the header buttons above (which drive the CPU%/GPU%
 metric and instant/accumulated window); clicking a CPU% or GPU% column
 header is equivalent to clicking the matching button. Columns are also
 individually resizable by dragging their border. Clicking anywhere on a row
-selects it (not just the PID cell), and `↑`/`↓` move the selection up/down
-through the current row order once no text field has focus.
+selects it (not just the PID cell). `↑`/`↓`, Page Up/Down, Home/End, and the
+numeric keypad navigate the current row order once no text field has focus;
+left/right (keypad 4/6) collapse or expand tree rows. Right-clicking a row
+opens its context menu for open files, copy info, and kill. The redundant
+Process menu is gone.
 
 ### Open files
 
@@ -174,8 +186,8 @@ that further back, neither of which rMon uses today).
 Accurate temperature alone never confirms silicon degradation — that's
 usually inferred from new instability under load, actual hardware-reported
 faults, or whether your BIOS/CPU microcode has a vendor's known fix (e.g.
-Intel's 13th/14th-gen voltage erratum). Open "🩺 Hardware health" from the
-GUI's App menu, press `H` (TUI), or run `rmon health` (CLI) for:
+Intel's 13th/14th-gen voltage erratum). Open the GUI's **health** tab,
+press `H` (TUI), or run `rmon health` (CLI) for:
 
 - **WHEA events** — `Microsoft-Windows-WHEA-Logger` entries from the
   System event log (`rmon-core::check_hardware_health`), with counts by
@@ -224,23 +236,233 @@ rights needed, and unchecking it fully reverses it. A `--minimized` launch
 starts with the window hidden, straight into the tray, so logging in
 doesn't pop a window up.
 
-## Temperature and throttle telemetry
+## Temperature, fans, and throttle telemetry
 
-- **GPU** (NVIDIA only, via NVML): per-GPU temperature and whether NVML
-  reports an unambiguous thermal throttle reason (`SwThermalSlowdown` /
-  `HwThermalSlowdown`) — i.e. clocks are being cut specifically because of
-  temperature, not just power capping or idle states.
-- **CPU**: Windows has no vendor-neutral "CPU temperature" or "throttled
-  because of temperature" API without a kernel driver (which is how tools
-  like HWiNFO read MSRs directly — rMon deliberately doesn't ship one).
-  Instead:
-  - Temperature comes from the ACPI thermal zone (`MSAcpi_ThermalZoneTemperature`
-    over WMI) when the system exposes one — on many machines it doesn't, in
-    which case it reads `n/a`.
-  - "Possibly throttled" is a heuristic: current clock speed is well below
-    the rated max (`Win32_Processor`) while overall CPU load is high. The
-    cause (thermal vs. power vs. something else) is **not** confirmed —
-    unlike the GPU signal, which NVML reports directly.
+Throttling is the one system-wide condition that silently invalidates every
+other number rMon shows: while a CPU is trimming duty cycle at its thermal
+limit, or a GPU is in thermal slowdown, every per-process CPU%/GPU% figure
+is measuring the *limit* rather than the workload, and nothing in the
+process table hints that this is what happened. So rMon shows it in the
+header, always — including when everything is fine, because a header that
+only speaks up when something is wrong leaves "fine" and "we have no idea"
+looking identical.
+
+Alongside the live badge there's a **throttle strip**: one column per second
+over the last five minutes, oldest on the left, with a summary such as
+"throttled 3% of last 4m12s". Amber marks the CPU being held back, red a GPU
+thermal slowdown, grey a tick where no thermal source could answer. Episodes
+that distort a benchmark or stretch a compile are often over in seconds, so
+the instantaneous badge alone would miss exactly the ones worth knowing
+about.
+
+### Where the numbers come from
+
+Windows exposes no vendor-neutral API for CPU package temperature, TjMax, a
+"throttled because of temperature" flag, or fan speed. Every tool that shows
+those reads model-specific registers (MSRs) and legacy LPC I/O ports, which
+are ring-0 only. rMon reads them itself, through **[PawnIO]** — the
+sandboxed, signed kernel driver that LibreHardwareMonitor and FanControl
+also moved to. Sources are tried strongest first:
+
+1. **CPU MSRs, via PawnIO** (needs PawnIO installed and rMon running as
+   Administrator). `IA32_TEMPERATURE_TARGET` gives this exact part's TjMax;
+   `IA32_PACKAGE_THERM_STATUS` gives temperature as a digital readout *below*
+   TjMax — so remaining headroom is the raw measurement rather than a
+   derived guess — plus status bits saying whether the thermal control
+   circuit is engaged right now, whether PROCHOT# is asserted, whether the
+   part is at critical temperature, and whether it's being held back by a
+   *power* cap instead of by heat. When this path is live, rMon reports
+   throttling as measured fact (`cpu_throttle_confirmed`), not as a
+   heuristic. Its sticky log bit also reveals whether throttling happened at
+   all since boot, catching episodes shorter than the one-second sampling
+   tick — shown as "has throttled since boot", never as a current state.
+2. **The Super I/O CPU sensor, via the same direct SensorHub**, when package
+   MSRs do not apply or cannot be opened. This is especially useful on AMD
+   systems. A socket-only input is not misrepresented as package temperature.
+3. **HWiNFO's export**, but only as a necessary CPU-temperature fallback
+   when neither direct source can answer. HWiNFO must already be running
+   with "Support of Value Sensors Bank" or "Shared Memory Support" enabled;
+   rMon does not install or launch it. The GUI's full supplemental HWiNFO
+   sensor tree is separate and off by default until explicitly enabled for
+   the session.
+4. **ACPI thermal zone** (`MSAcpi_ThermalZoneTemperature` over WMI) plus
+   the kernel's processor-power clock ratio. On many machines the zone is
+   absent, inaccurate, or not measuring the CPU package at all, and "throttled" here
+   is only an inference from clocks running below the rated maximum under
+   load — shown as "likely throttled", with the cause unconfirmed.
+
+**GPU** telemetry is separate and needs no driver: NVML reports per-GPU
+temperature and whether an unambiguous thermal slowdown
+(`SwThermalSlowdown` / `HwThermalSlowdown`) is active, distinct from power
+capping. NVIDIA only.
+
+### Motherboard temperatures, voltages, and fans
+
+The existing SensorHub reads all three classes directly from the
+motherboard's Super I/O chip through PawnIO's `LpcIO` module; no HWiNFO or
+.NET hardware-monitoring library is involved. NCT668x exposes named board,
+VRM, PCH, socket, PCIe, and M.2 temperature channels plus fourteen voltage
+channels. NCT67xx exposes routed temperature inputs and 8 mV voltage ADC
+pins. On NCT67xx, rMon intentionally labels voltages as `VINn (ADC pin)`:
+turning a pin voltage into a +5V/+12V rail requires motherboard-specific
+resistor-divider data, and a generic scaling factor would look credible
+while being wrong.
+
+Fan tachometers live in the same Super I/O block (Nuvoton, ITE and Fintek
+make nearly all of them). rMon identifies the chip over the LPC
+configuration ports and reads its fan counters through PawnIO's `LpcIO`
+module. Two Nuvoton families are decoded:
+
+- **NCT67xx** (NCT6771F through NCT6799D): a banked register space, with
+  fan speed as a 13-bit period counter — `RPM = 1.35e6 / count`.
+- **NCT668x** (NCT6683D/6686D/6687D, used on MSI boards): a *paged EC
+  space* with its own claim/release handshake on the page register, and
+  fan speed as a direct 16-bit RPM value.
+
+ITE IT87xx chips are identified and named but not read, because a
+plausible-looking wrong RPM is worse than an honest "not decoded".
+
+A board can carry a Super I/O on **both** configuration ports, and the one
+that owns the fan headers is not necessarily the first to answer. The
+machine this was developed on is exactly that: an NCT6796D-R sits at 0x4E
+with every channel empty, while the NCT6686D at 0x2E has the actual fans.
+rMon therefore keeps and reads every chip it finds — stopping at the first
+match produces a confident, fully working read of nothing at all.
+
+A channel with nothing spinning on it reads "no fan connected" rather than
+"0 rpm", since an unused header and a stalled CPU fan must not look the
+same. Readings above 40,000 RPM are rejected outright: an empty NCT67xx
+channel reads `0xFF 0x1F`, which is a saturated counter but would decode to
+a plausible-looking "65311 rpm" if it were read as a direct value.
+
+The LPC bus has no arbitration of its own — reading a register means writing
+an index and then reading a data port, so an interleaved access from another
+tool makes both sides read the wrong register. rMon holds the conventional
+`Access_ISABUS.HTP.Method` named mutex that HWiNFO, LibreHardwareMonitor and
+vendor utilities also honour, and skips the read rather than racing if it
+can't get it.
+
+Fan **control** (writing PWM duty) is not implemented yet. Reading is
+deliberately first: two controllers writing the same registers fight each
+other, and a crash mid-write can leave fans pinned or stopped until reboot.
+
+### How FanControl does it, and what the write path would need
+
+FanControl itself is closed source, but it doesn't talk to hardware
+directly: its sensor and control layer is `LibreHardwareMonitorLib` (open,
+MPL-2.0) on top of PawnIO, i.e. the same two components rMon now uses. Its
+own contribution is the architecture around them — `FanControl.Service.exe`
+runs elevated as a Windows service and the UI talks to it over a gRPC
+named pipe (`FanControl.IPC` on `GrpcDotNetNamedPipes`), which is how the
+UI avoids running as Administrator; plus a plugin surface
+(`FanControl.Plugins`: `IPluginSensor`, `IPluginControlSensor`) that lets
+third parties add sensors, including one that reads HWiNFO.
+
+So "independent of FanControl" mostly means reimplementing what LHM's
+`Nct677X` does. For writes on the NCT668x parts that is:
+
+1. Request a configuration window: write `0x80` to `0xA01`, wait ~50 ms.
+2. Set the channel's manual-mode bit: read `0xA00`, OR in `1 << channel`,
+   write it back. This takes the channel off the EC's SmartFAN curve.
+3. Write the duty value (0–255) to `0xA28 + channel`.
+4. Commit: write `0x40` to `0xA01`, wait ~50 ms.
+
+The NCT67xx parts are simpler: write `0` to the channel's control-mode
+register to select manual, then the duty to its PWM command register.
+
+Two things have to come with that, not after it. The initial mode and duty
+of every channel must be saved before the first write and restored on exit,
+or quitting rMon leaves the fans wherever it last set them. And a running
+FanControl writes these same registers on its own schedule, so both would
+fight over every channel — the ISA mutex serialises individual register
+accesses but cannot arbitrate *policy*. Detecting FanControl and refusing
+to take over a channel it owns is part of the work, not a nicety.
+
+### Why PawnIO and not WinRing0
+
+The traditional way to do all of the above is WinRing0, which hands
+unrestricted MSR and port I/O to whoever can open it. That generality is the
+problem: it is a well-known privilege-escalation primitive (CVE-2020-14979),
+it appears on Microsoft's vulnerable-driver blocklist, and Defender flags it
+as a HackTool. Shipping it would mean shipping a local privilege-escalation
+vulnerability alongside a process monitor.
+
+PawnIO instead runs small signed [Pawn] bytecode modules in a sandbox inside
+the driver, and enforces what each one may touch. The `IntelMSR` module
+permits about thirty thermal and power MSRs and returns `STATUS_ACCESS_DENIED`
+for anything else; `LpcIO` refuses any port outside the Super I/O
+configuration pair and the base addresses it discovered, and blacklists the
+PCI configuration ports outright. There is no IOCTL that means "give me
+arbitrary kernel memory".
+
+rMon **does not install the driver** — it detects `PawnIOLib.dll` and uses it
+if present. Install PawnIO yourself from <https://pawnio.eu> if you want the
+direct path; without it, rMon uses HWiNFO only when needed for the CPU
+thermal fallback, then ACPI, and says so in the sensors tab. Supplemental
+HWiNFO sensors remain explicit opt-in. The signed module blobs rMon loads
+are vendored under `crates/rmon-core/vendor/pawnio/` from the upstream
+[PawnIO.Modules] release (LGPL-2.1-or-later; see the `COPYING` file beside
+them). They cannot be rebuilt locally — the driver only accepts modules
+carrying the upstream signature, which is exactly the property that makes
+the sandbox worth trusting.
+
+[PawnIO]: https://pawnio.eu
+[Pawn]: https://github.com/compuphase/pawn
+[PawnIO.Modules]: https://github.com/namazso/PawnIO.Modules
+
+## Analysis agent (LLM)
+
+The **analyze** tab asks a language model to explain what is making the
+machine slow, using rMon's own telemetry as its only evidence. It is a Rust
+agent core (`crates/rmon-agent`) talking to any OpenAI-compatible
+`/v1/chat/completions` endpoint — by default [Passiv], which fronts models
+through LiteLLM.
+
+```powershell
+$env:RMON_LLM_API_KEY = "<passiv gateway key>"
+$env:RMON_LLM_MODEL   = "<a model the gateway serves>"
+# optional: staging instead of production
+$env:RMON_LLM_BASE_URL = "https://gateway-dev.mezzanin.eu/v1"
+```
+
+The key is read from the environment (`RMON_LLM_API_KEY`, falling back to
+`OPENAI_API_KEY`) and is never written to the SQLite store, the config, or
+the repo. With no key the tab explains what to set instead of failing.
+
+### What it can and cannot do
+
+Its tools are rMon's read paths: system thermal/throttle/fan state, ranked
+process listings, per-process detail, and the leak/idle trend suspects.
+
+The only action it can reach is `propose_kill_process`, and that **does not
+kill anything** — it returns a proposal that appears in the tab with
+"kill it" / "dismiss" buttons, and the kill runs from the button handler,
+never from the agent loop. The model is told explicitly that nothing was
+terminated, so it cannot proceed as though its suggestion had been carried
+out. An LLM misreading a CPU spike and terminating a system process on a
+monitoring tool's authority is not a risk worth the convenience saved.
+
+Two other bounds are structural rather than advisory: tool iterations are
+capped, and on hitting the cap the agent is asked to conclude from what it
+has (with tools withdrawn) rather than looping; and a tool that errors
+reports the error back to the model instead of aborting the turn, so a
+malformed argument is recoverable.
+
+### On honesty in the tool output
+
+rMon distinguishes "measured zero" from "could not measure" everywhere, and
+the tool layer carries that into JSON as `null`. This matters more for a
+model than for a person: asked why a machine is slow, a model handed
+`"fraction_of_time_limited": 0` will confidently rule out thermal causes it
+has no evidence about. The system prompt states the rule, the tools emit
+`null`, and the throttle verdict ships with
+`throttle_measured_not_inferred` so the model can tell the CPU's own status
+register from the clock-speed heuristic.
+
+The agent runs on a worker thread; sampling and rendering are untouched
+while it waits on the network.
+
+[Passiv]: https://gateway.mezzanin.eu
 
 ## MCP server
 

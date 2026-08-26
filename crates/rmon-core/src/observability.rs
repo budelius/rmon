@@ -235,8 +235,8 @@ fn parse_otlp_headers(raw: &str) -> Vec<(String, String)> {
 
 /// Ship the event as an OTLP/HTTP JSON LogRecord to `<endpoint>/v1/logs`.
 fn send_otlp(document: &serde_json::Value, level: &str) -> bool {
-    let Some(endpoint) = env_var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .map(|e| e.trim_end_matches('/').to_string())
+    let Some(endpoint) =
+        env_var("OTEL_EXPORTER_OTLP_ENDPOINT").map(|e| e.trim_end_matches('/').to_string())
     else {
         eprintln!("[OTLP] {document}");
         return false;

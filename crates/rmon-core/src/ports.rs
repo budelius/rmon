@@ -9,16 +9,16 @@
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
-    MIB_TCP_STATE, MIB_TCP_STATE_CLOSE_WAIT, MIB_TCP_STATE_CLOSED, MIB_TCP_STATE_CLOSING,
-    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_FIN_WAIT1,
-    MIB_TCP_STATE_FIN_WAIT2, MIB_TCP_STATE_LAST_ACK, MIB_TCP_STATE_LISTEN,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP_STATE, MIB_TCP_STATE_CLOSE_WAIT,
+    MIB_TCP_STATE_CLOSED, MIB_TCP_STATE_CLOSING, MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
+    MIB_TCP_STATE_FIN_WAIT1, MIB_TCP_STATE_FIN_WAIT2, MIB_TCP_STATE_LAST_ACK, MIB_TCP_STATE_LISTEN,
     MIB_TCP_STATE_SYN_RCVD, MIB_TCP_STATE_SYN_SENT, MIB_TCP_STATE_TIME_WAIT,
-    MIB_UDP6TABLE_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+    MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
@@ -150,7 +150,14 @@ pub fn listening_ports_for(ports: &[PortEntry], pid: u32) -> Vec<PortEntry> {
 fn list_tcp4() -> Result<Vec<PortEntry>> {
     let buf = unsafe {
         query_growing_buffer(|ptr, size| {
-            GetExtendedTcpTable(Some(ptr), size, true, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
+            GetExtendedTcpTable(
+                Some(ptr),
+                size,
+                true,
+                AF_INET.0 as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
         })
     }?;
     let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
@@ -178,7 +185,14 @@ fn list_tcp4() -> Result<Vec<PortEntry>> {
 fn list_tcp6() -> Result<Vec<PortEntry>> {
     let buf = unsafe {
         query_growing_buffer(|ptr, size| {
-            GetExtendedTcpTable(Some(ptr), size, true, AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
+            GetExtendedTcpTable(
+                Some(ptr),
+                size,
+                true,
+                AF_INET6.0 as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
         })
     }?;
     let table = buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
@@ -205,7 +219,14 @@ fn list_tcp6() -> Result<Vec<PortEntry>> {
 fn list_udp4() -> Result<Vec<PortEntry>> {
     let buf = unsafe {
         query_growing_buffer(|ptr, size| {
-            GetExtendedUdpTable(Some(ptr), size, true, AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0)
+            GetExtendedUdpTable(
+                Some(ptr),
+                size,
+                true,
+                AF_INET.0 as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
         })
     }?;
     let table = buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
@@ -228,7 +249,14 @@ fn list_udp4() -> Result<Vec<PortEntry>> {
 fn list_udp6() -> Result<Vec<PortEntry>> {
     let buf = unsafe {
         query_growing_buffer(|ptr, size| {
-            GetExtendedUdpTable(Some(ptr), size, true, AF_INET6.0 as u32, UDP_TABLE_OWNER_PID, 0)
+            GetExtendedUdpTable(
+                Some(ptr),
+                size,
+                true,
+                AF_INET6.0 as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
         })
     }?;
     let table = buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID;

@@ -4,14 +4,14 @@
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
-use windows::core::PCWSTR;
+use anyhow::{Result, bail};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Performance::{
+    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-    PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_MORE_DATA,
+    PdhOpenQueryW,
 };
+use windows::core::PCWSTR;
 
 const COUNTER_PATH: &str = r"\GPU Engine(*)\Utilization Percentage";
 
@@ -37,15 +37,12 @@ impl PdhGpuMonitor {
 
             let path_wide = to_wide(COUNTER_PATH);
             let mut counter = PDH_HCOUNTER::default();
-            let status = PdhAddEnglishCounterW(
-                query,
-                PCWSTR(path_wide.as_ptr()),
-                0,
-                &mut counter,
-            );
+            let status = PdhAddEnglishCounterW(query, PCWSTR(path_wide.as_ptr()), 0, &mut counter);
             if status != ERROR_SUCCESS.0 {
                 let _ = PdhCloseQuery(query);
-                bail!("PdhAddEnglishCounterW failed: 0x{status:08X} (no 'GPU Engine' counters on this system)");
+                bail!(
+                    "PdhAddEnglishCounterW failed: 0x{status:08X} (no 'GPU Engine' counters on this system)"
+                );
             }
 
             Ok(Self { query, counter })

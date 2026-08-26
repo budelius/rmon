@@ -19,16 +19,16 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::Instant;
 
-use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, TokenUser, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::core::PWSTR;
 
-use crate::handles::{read_unicode_string_at, UnicodeString};
+use crate::handles::{UnicodeString, read_unicode_string_at};
 
 const SYSTEM_PROCESS_INFORMATION_CLASS: u32 = 5;
 const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION_CLASS: u32 = 8;
@@ -143,13 +143,13 @@ impl CpuMonitor {
             .unwrap_or(0);
         self.last_sample_at = Some(now);
 
-        let entries = match query_system_buffer(
-            SYSTEM_PROCESS_INFORMATION_CLASS,
-            &mut self.buf,
-        ) {
+        let entries = match query_system_buffer(SYSTEM_PROCESS_INFORMATION_CLASS, &mut self.buf) {
             Ok(len) => len,
             Err(status) => {
-                log::warn!("SystemProcessInformation query failed: 0x{:08X}", status as u32);
+                log::warn!(
+                    "SystemProcessInformation query failed: 0x{:08X}",
+                    status as u32
+                );
                 return HashMap::new();
             }
         };
@@ -207,7 +207,12 @@ impl CpuMonitor {
                 );
                 cache.insert(
                     pid,
-                    ProcCache { name, cpu_time_100ns: cpu_time, user, command_line },
+                    ProcCache {
+                        name,
+                        cpu_time_100ns: cpu_time,
+                        user,
+                        command_line,
+                    },
                 );
             }
 
@@ -240,7 +245,9 @@ impl CpuMonitor {
         let (mut idle, mut busy) = (0u64, 0u64);
         for i in 0..len / stride {
             let p = unsafe {
-                std::ptr::read_unaligned(self.perf_buf.as_ptr().add(i * stride) as *const ProcessorPerf)
+                std::ptr::read_unaligned(
+                    self.perf_buf.as_ptr().add(i * stride) as *const ProcessorPerf
+                )
             };
             // KernelTime includes IdleTime, so busy = kernel - idle + user.
             idle += p.idle_time.max(0) as u64;
@@ -293,7 +300,12 @@ unsafe fn nt_query_system_information(class: u32, buf: &mut [u8], ret_len: &mut 
         SystemInformationLength: u32, ReturnLength: *mut u32
     ) -> i32);
     unsafe {
-        NtQuerySystemInformation(class, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, ret_len)
+        NtQuerySystemInformation(
+            class,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            ret_len,
+        )
     }
 }
 
@@ -454,7 +466,9 @@ mod tests {
         assert!(me.handle_count.is_some_and(|h| h > 0));
         assert!(me.user.is_some(), "own process user must resolve");
         assert!(
-            me.command_line.as_deref().is_some_and(|c| c.contains("rmon")),
+            me.command_line
+                .as_deref()
+                .is_some_and(|c| c.contains("rmon")),
             "command line: {:?}",
             me.command_line
         );

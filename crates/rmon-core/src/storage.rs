@@ -92,11 +92,7 @@ impl Store {
     }
 
     /// All samples with `ts` in `[since, until]`, ordered oldest first.
-    pub fn query_range(
-        &self,
-        since: DateTime<Utc>,
-        until: DateTime<Utc>,
-    ) -> Result<Vec<Snapshot>> {
+    pub fn query_range(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<Snapshot>> {
         let mut stmt = self.conn.prepare(
             "SELECT ts, pid, ppid, name, cpu_percent, gpu_percent, gpu_source, handle_count, mem_bytes
              FROM samples WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts ASC",
@@ -132,8 +128,8 @@ impl Store {
                     last.processes.push(sample);
                 }
                 _ => {
-                    let timestamp = DateTime::from_timestamp_millis(ts_millis)
-                        .unwrap_or_else(Utc::now);
+                    let timestamp =
+                        DateTime::from_timestamp_millis(ts_millis).unwrap_or_else(Utc::now);
                     snapshots.push(Snapshot {
                         timestamp,
                         processes: vec![sample],
@@ -176,12 +172,10 @@ impl Store {
 
     /// Deletes samples older than `before`. Returns the number of rows removed.
     pub fn prune_before(&self, before: DateTime<Utc>) -> Result<usize> {
-        let n = self
-            .conn
-            .execute(
-                "DELETE FROM samples WHERE ts < ?1",
-                rusqlite::params![before.timestamp_millis()],
-            )?;
+        let n = self.conn.execute(
+            "DELETE FROM samples WHERE ts < ?1",
+            rusqlite::params![before.timestamp_millis()],
+        )?;
         Ok(n)
     }
 }
@@ -227,10 +221,8 @@ mod tests {
 
     #[test]
     fn opening_a_pre_handle_tracking_db_migrates_it() {
-        let path = std::env::temp_dir().join(format!(
-            "rmon-migration-test-{}.sqlite",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rmon-migration-test-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // Seed a database with the original schema (no handle/memory columns).

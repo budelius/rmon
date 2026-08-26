@@ -27,19 +27,28 @@
 //! Both are best-effort and return `None` if HWiNFO isn't running or has
 //! neither mechanism enabled — callers fall back to the ACPI thermal zone.
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Memory::{
-    MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
+    FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
 };
-use winreg::enums::HKEY_CURRENT_USER;
+use windows::core::PCWSTR;
 use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
 /// HWiNFO mirrors at most a few hundred sensors to the VSB registry key
 /// even on elaborate rigs, and indices aren't contiguous (a sensor can
 /// disappear from the middle of the list) — scan generously rather than
 /// stopping at the first gap.
 const MAX_VSB_INDEX: u32 = 512;
+
+/// True for sensor labels belonging to the CPU rather than another
+/// component. HWiNFO labels CPU readings with either "CPU" ("CPU
+/// Package", "CPU IA Cores") or "Core" ("Core Max", "Core Distance to
+/// TjMAX"). The "core" spelling also appears on GPU sensors ("GPU Core
+/// Temperature"), so an explicit GPU exclusion keeps those out.
+fn is_cpu_scoped_label(label: &str) -> bool {
+    !label.contains("gpu") && (label.contains("cpu") || label.contains("core"))
+}
 
 /// Picks a CPU temperature out of a list of (label, value) readings
 /// already known to be CPU-scoped: prefers the whole-package number,
@@ -55,7 +64,9 @@ fn pick_cpu_temp(readings: &[(String, f32)]) -> Option<f32> {
 
     let core_temps: Vec<f32> = readings
         .iter()
-        .filter(|(label, _)| label.contains("core") && !label.contains("distance") && !label.contains("max"))
+        .filter(|(label, _)| {
+            label.contains("core") && !label.contains("distance") && !label.contains("max")
+        })
         .map(|(_, t)| *t)
         .collect();
     if !core_temps.is_empty() {
@@ -66,11 +77,15 @@ fn pick_cpu_temp(readings: &[(String, f32)]) -> Option<f32> {
         .then(|| readings.iter().map(|(_, t)| *t).sum::<f32>() / readings.len() as f32)
 }
 
-/// Reads CPU temperature readings out of HWiNFO's Registry Value Sensor
-/// Bank (`HKCU\Software\HWiNFO64\VSB`), if that feature is enabled.
-fn read_vsb_cpu_temp() -> Option<f32> {
+/// Reads CPU-scoped temperature readings out of HWiNFO's Registry Value
+/// Sensor Bank (`HKCU\Software\HWiNFO64\VSB`), if that feature is
+/// enabled. Empty when it isn't, or when the user's tray list happens to
+/// contain no CPU temperatures.
+fn read_vsb_cpu_temps() -> Vec<(String, f32)> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let vsb = hkcu.open_subkey("Software\\HWiNFO64\\VSB").ok()?;
+    let Ok(vsb) = hkcu.open_subkey("Software\\HWiNFO64\\VSB") else {
+        return Vec::new();
+    };
 
     let mut readings = Vec::new();
     for i in 0..MAX_VSB_INDEX {
@@ -78,7 +93,7 @@ fn read_vsb_cpu_temp() -> Option<f32> {
             continue;
         };
         let label = label.to_lowercase();
-        if !label.contains("cpu") {
+        if !is_cpu_scoped_label(&label) {
             continue;
         }
         // `Value{i}` carries the unit (e.g. "65 °C") so we can confirm
@@ -100,7 +115,7 @@ fn read_vsb_cpu_temp() -> Option<f32> {
         readings.push((label, temp));
     }
 
-    pick_cpu_temp(&readings)
+    readings
 }
 
 const SHARED_MEM_PATH: &str = "Global\\HWiNFO_SENS_SM2";
@@ -214,9 +229,9 @@ impl Drop for SharedMem {
     }
 }
 
-/// Reads CPU temperature readings out of HWiNFO's shared memory section,
-/// if Shared Memory Support is enabled.
-fn read_shm_cpu_temp() -> Option<f32> {
+/// Reads CPU-scoped temperature readings out of HWiNFO's shared memory
+/// section, if Shared Memory Support is enabled. `None` when it isn't.
+fn read_shm_cpu_temps() -> Option<Vec<(String, f32)>> {
     let mem = SharedMem::open()?;
     let header: Header = unsafe { mem.read(0) };
     if header.magic != HEADER_MAGIC
@@ -253,24 +268,65 @@ fn read_shm_cpu_temp() -> Option<f32> {
         .map(|e| (c_str_lower(&e.name_original), e.value as f32))
         .collect();
 
-    pick_cpu_temp(&readings)
+    Some(readings)
 }
 
-/// Best-effort CPU temperature (°C), trying HWiNFO's registry-exposed
-/// sensors first (works today for anyone with "Support of Value Sensors
-/// Bank" enabled, which this codebase's target user already has), then
-/// its shared memory section. Returns `None` if HWiNFO isn't running or
-/// has neither mechanism enabled.
+/// CPU-scoped temperature readings from whichever HWiNFO export is
+/// available, trying the registry Value Sensor Bank first (works today
+/// for anyone with "Support of Value Sensors Bank" enabled, which this
+/// codebase's target user already has), then shared memory.
+fn cpu_temp_readings() -> Vec<(String, f32)> {
+    let vsb = read_vsb_cpu_temps();
+    if !vsb.is_empty() {
+        return vsb;
+    }
+    read_shm_cpu_temps().unwrap_or_default()
+}
+
+/// Best-effort CPU temperature (°C). Returns `None` if HWiNFO isn't
+/// running or has neither export mechanism enabled.
 pub fn read_cpu_temp() -> Option<f32> {
-    read_vsb_cpu_temp().or_else(read_shm_cpu_temp)
+    pick_cpu_temp(&cpu_temp_readings())
+}
+
+/// Both CPU thermal facts — `(temperature °C, °C below TjMax)` — from a
+/// single pass over HWiNFO's export.
+///
+/// The second value is the honest way to answer "is this CPU at its
+/// thermal limit": TjMax is vendor- and part-specific (100°C on Intel
+/// desktop parts, but AMD's Tctl sits at 95°C during *normal*
+/// operation), so comparing a raw temperature against a hardcoded
+/// ceiling false-positives on some CPUs and false-negatives on others.
+/// When present, the CPU is telling us its own remaining headroom and no
+/// threshold is needed. It's the *minimum* distance across cores, since
+/// the hottest core is what triggers throttling. `None` means HWiNFO
+/// doesn't expose it — not that there's headroom to spare.
+///
+/// Returned together because the VSB path scans up to [`MAX_VSB_INDEX`]
+/// registry entries; callers sampling every tick would otherwise pay
+/// that twice for no benefit.
+pub fn read_cpu_thermal() -> (Option<f32>, Option<f32>) {
+    let readings = cpu_temp_readings();
+    (pick_cpu_temp(&readings), tjmax_distance(&readings))
+}
+
+fn tjmax_distance(readings: &[(String, f32)]) -> Option<f32> {
+    readings
+        .iter()
+        .filter(|(label, _)| label.contains("tjmax"))
+        .map(|(_, v)| *v)
+        .fold(None, |acc: Option<f32>, v| {
+            Some(acc.map_or(v, |a| a.min(v)))
+        })
 }
 
 /// Every sensor reading HWiNFO exposes, grouped the same way its own
-/// Sensors window groups them. Tries shared memory first (comprehensive —
-/// every sensor HWiNFO tracks, regardless of what's in its tray list),
-/// falling back to whatever's mirrored in the VSB registry key. Returns an
-/// empty `Vec` if HWiNFO isn't running or exposes nothing via either
-/// mechanism.
+/// Sensors window groups them. This is an explicitly requested,
+/// supplemental view; [`crate::Sampler`] never calls it. Tries shared
+/// memory first (comprehensive — every sensor HWiNFO tracks, regardless of
+/// what's in its tray list), falling back to whatever is mirrored in the
+/// VSB registry key. Returns an empty `Vec` if HWiNFO is not running or
+/// exposes nothing via either mechanism.
 pub fn read_all_sensors() -> Vec<SensorGroup> {
     read_all_sensors_shm().unwrap_or_else(read_all_sensors_vsb)
 }
@@ -355,7 +411,9 @@ fn read_all_sensors_vsb() -> Vec<SensorGroup> {
                 groups.len() - 1
             }
         };
-        groups[group_idx].readings.push(SensorReading { label, value });
+        groups[group_idx]
+            .readings
+            .push(SensorReading { label, value });
     }
 
     groups
@@ -376,7 +434,9 @@ mod tests {
                 println!("read_cpu_temp() -> {t} °C");
                 assert!((-50.0..150.0).contains(&t), "implausible temperature: {t}");
             }
-            None => println!("read_cpu_temp() -> None (HWiNFO not running / no mechanism enabled here)"),
+            None => {
+                println!("read_cpu_temp() -> None (HWiNFO not running / no mechanism enabled here)")
+            }
         }
     }
 

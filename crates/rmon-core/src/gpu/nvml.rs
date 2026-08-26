@@ -68,9 +68,7 @@ impl NvmlGpuMonitor {
         (0..self.device_count)
             .filter_map(|idx| {
                 let device = self.nvml.device_by_index(idx).ok()?;
-                let name = device
-                    .name()
-                    .unwrap_or_else(|_| format!("GPU {idx}"));
+                let name = device.name().unwrap_or_else(|_| format!("GPU {idx}"));
                 let temp_c = device
                     .temperature(TemperatureSensor::Gpu)
                     .ok()
@@ -98,10 +96,7 @@ fn throttle_reason_labels(reasons: ThrottleReasons) -> Vec<String> {
         (ThrottleReasons::SW_THERMAL_SLOWDOWN, "sw-thermal"),
         (ThrottleReasons::HW_THERMAL_SLOWDOWN, "hw-thermal"),
         (ThrottleReasons::HW_SLOWDOWN, "hw-slowdown"),
-        (
-            ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN,
-            "hw-power-brake",
-        ),
+        (ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN, "hw-power-brake"),
         (ThrottleReasons::SW_POWER_CAP, "power-cap"),
         (ThrottleReasons::SYNC_BOOST, "sync-boost"),
         (

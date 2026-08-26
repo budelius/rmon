@@ -5082,8 +5082,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmon-agent"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "log",
+ "reqwest",
+ "rmon-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rmon-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5101,7 +5114,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5121,7 +5134,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5129,6 +5142,7 @@ dependencies = [
  "egui_extras",
  "egui_plot",
  "ico",
+ "rmon-agent",
  "rmon-core",
  "tray-icon",
  "winreg",
@@ -5137,7 +5151,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",

@@ -64,7 +64,10 @@ impl GpuMonitor {
     /// Per-GPU temperature/throttle telemetry (empty when NVML is unavailable —
     /// PDH counters don't expose temperature or throttle reasons).
     pub fn telemetry(&self) -> Vec<GpuTelemetry> {
-        self.nvml.as_ref().map(|n| n.telemetry()).unwrap_or_default()
+        self.nvml
+            .as_ref()
+            .map(|n| n.telemetry())
+            .unwrap_or_default()
     }
 }
 

@@ -15,7 +15,11 @@ use crate::proc_events::RecentExit;
 /// descendants — so e.g. a browser's main process outranks unrelated
 /// processes based on the total usage of all its renderer/GPU children, not
 /// just its own (often small) share.
-pub fn build_tree<F>(processes: &[ProcessSample], mut key: F, by_subtree: bool) -> Vec<(usize, ProcessSample)>
+pub fn build_tree<F>(
+    processes: &[ProcessSample],
+    mut key: F,
+    by_subtree: bool,
+) -> Vec<(usize, ProcessSample)>
 where
     F: FnMut(&ProcessSample) -> f32,
 {
@@ -27,7 +31,9 @@ where
         // `contains` and `!= p.pid` guard against self-parented and (rarer)
         // cyclic entries — e.g. Windows' System Idle Process is pid 0 with
         // ppid 0 — which would otherwise loop the DFS below forever.
-        let parent = p.ppid.filter(|ppid| pid_set.contains(ppid) && *ppid != p.pid);
+        let parent = p
+            .ppid
+            .filter(|ppid| pid_set.contains(ppid) && *ppid != p.pid);
         children.entry(parent).or_default().push(p);
         by_pid.insert(p.pid, p);
     }
@@ -178,7 +184,9 @@ where
 
     let mut sums: HashMap<u32, f32> = HashMap::with_capacity(order.len());
     for pid in order.into_iter().rev() {
-        let Some(node) = by_pid.get(&pid) else { continue };
+        let Some(node) = by_pid.get(&pid) else {
+            continue;
+        };
         let own = key(node);
         let child_sum: f32 = children
             .get(&Some(pid))
@@ -258,14 +266,18 @@ mod tests {
         // (5+20+70=95, since child pid 3's subtree is 70+... let's compute
         // precisely below) should outrank B.
         let procs = vec![
-            proc(1, None, 5.0),   // A, subtree = 5 + 20 + (30 + 40) = 95
+            proc(1, None, 5.0), // A, subtree = 5 + 20 + (30 + 40) = 95
             proc(2, Some(1), 20.0),
             proc(3, Some(1), 30.0),
             proc(4, Some(3), 40.0),
             proc(10, None, 50.0), // B, subtree = 50
         ];
         let tree = build_tree(&procs, |p| p.cpu_percent, true);
-        let top_level: Vec<u32> = tree.iter().filter(|(d, _)| *d == 0).map(|(_, p)| p.pid).collect();
+        let top_level: Vec<u32> = tree
+            .iter()
+            .filter(|(d, _)| *d == 0)
+            .map(|(_, p)| p.pid)
+            .collect();
         assert_eq!(top_level, vec![1, 10]);
     }
 

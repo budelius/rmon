@@ -4,8 +4,8 @@
 
 use std::io;
 
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "rMon";
