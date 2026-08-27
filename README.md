@@ -116,8 +116,10 @@ Process menu is gone.
 
 The GUI's **programs** tab (and `rmon programs` in the CLI) reads the
 per-machine/per-user, 32/64-bit Windows Uninstall registry views used by
-classic Programs and Features. It shows publisher/version/location/size,
-then associates live processes by their full executable path. Parent chains
+classic Programs and Features. The searchable table can be sorted by program,
+process count, inclusive CPU/GPU load, memory, or **Last seen** (CPU descending
+by default). It shows publisher/version/location/size, then associates live
+processes by their full executable path. Parent chains
 are kept separately from package ownership, so a terminal such as Warp can
 show `warp.exe → find.exe` and include the child in its live CPU/GPU/memory
 total even though `find.exe` is a Windows executable rather than a Warp
@@ -130,9 +132,14 @@ Win32 software. rMon shows those known links and the observed process tree;
 it does not invent links from similar names. Portable executables and some
 Store packages may also be absent from this registry inventory.
 
+**Last seen** is the last time rMon itself observed an attributable process,
+persisted in `%APPDATA%\rMon\program-usage.json`; it is not a Windows-provided
+last-used timestamp. `never` means “not observed by rMon,” not “unused.” The
+file stores only program ids and timestamps—no command lines or paths.
+
 **Removal review** filters to entries that are not running/observed in this
-rMon session, have a registered uninstaller, are not marked as a system
-component/update, and have no known dependent uninstall entry. That means
+rMon session or the last 30 days, have a registered uninstaller, are not marked
+as a system component/update, and have no known dependent uninstall entry. That means
 “candidate to investigate,” never “safe to uninstall”: session inactivity is
 not a reliable last-used timestamp, and unknown dependencies remain unknown.
 rMon never runs an uninstall command.

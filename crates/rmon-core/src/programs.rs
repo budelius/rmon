@@ -9,7 +9,10 @@
 //! The API keeps those limits explicit instead of inventing certainty.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use winreg::RegKey;
 use winreg::enums::{
@@ -19,6 +22,13 @@ use winreg::enums::{
 use crate::ProcessSample;
 
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+const USAGE_FILE_VERSION: u32 = 1;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProgramUsageFile {
+    version: u32,
+    last_observed: HashMap<String, DateTime<Utc>>,
+}
 
 /// Whether an uninstall entry applies to this user or the whole machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +178,53 @@ impl ProgramActivity {
 pub struct ProgramAttribution {
     pub links: Vec<ProcessProgramLink>,
     pub activities: Vec<ProgramActivity>,
+}
+
+/// `%APPDATA%\rMon\program-usage.json`.
+fn usage_path() -> Result<PathBuf> {
+    let mut path = crate::config::path()?;
+    path.set_file_name("program-usage.json");
+    Ok(path)
+}
+
+/// Loads timestamps at which rMon last observed a live process attributable
+/// to each installed-program id. This is rMon's own observation history, not
+/// a Windows-provided last-used database.
+pub fn load_program_usage() -> Result<HashMap<String, DateTime<Utc>>> {
+    let path = usage_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let file: ProgramUsageFile =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if file.version != USAGE_FILE_VERSION {
+        return Err(anyhow!(
+            "unsupported program usage file version {}",
+            file.version
+        ));
+    }
+    Ok(file.last_observed)
+}
+
+/// Atomically persists rMon's program observation timestamps. No command
+/// lines, process paths, or credentials are stored in this file.
+pub fn save_program_usage(last_observed: &HashMap<String, DateTime<Utc>>) -> Result<()> {
+    let path = usage_path()?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("program usage path has no parent directory"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let file = ProgramUsageFile {
+        version: USAGE_FILE_VERSION,
+        last_observed: last_observed.clone(),
+    };
+    let text = serde_json::to_string_pretty(&file).context("serialising program usage")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
 }
 
 /// Reads all four conventional Uninstall registry views.
@@ -458,16 +515,47 @@ struct ProgramMatchRule {
 }
 
 fn program_match_rules(programs: &[InstalledProgram]) -> Vec<ProgramMatchRule> {
-    programs
+    let locations: Vec<_> = programs
         .iter()
-        .enumerate()
-        .filter_map(|(index, program)| {
-            let location = normalized_optional_path(&program.install_location);
-            let icon = program
+        .map(|program| {
+            normalized_optional_path(&program.install_location)
+                .filter(|location| !is_generic_install_location(location))
+        })
+        .collect();
+    let icons: Vec<_> = programs
+        .iter()
+        .map(|program| {
+            program
                 .display_icon
                 .as_deref()
                 .and_then(display_icon_path)
-                .map(|path| normalize_path(&path));
+                .map(|path| normalize_path(&path))
+        })
+        .collect();
+    let mut location_counts: HashMap<&str, usize> = HashMap::new();
+    for location in locations.iter().flatten() {
+        *location_counts.entry(location).or_default() += 1;
+    }
+    let mut icon_counts: HashMap<&str, usize> = HashMap::new();
+    for icon in icons.iter().flatten() {
+        *icon_counts.entry(icon).or_default() += 1;
+    }
+
+    programs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _program)| {
+            // A shared location (Office components are a common example)
+            // cannot identify which uninstall entry owns an executable.
+            // Keep exact DisplayIcon matches, but drop ambiguous directory
+            // rules rather than assigning activity to whichever entry sorts
+            // first.
+            let location = locations[index]
+                .clone()
+                .filter(|location| location_counts.get(location.as_str()) == Some(&1));
+            let icon = icons[index]
+                .clone()
+                .filter(|icon| icon_counts.get(icon.as_str()) == Some(&1));
             (location.is_some() || icon.is_some()).then_some(ProgramMatchRule {
                 index,
                 location,
@@ -475,6 +563,26 @@ fn program_match_rules(programs: &[InstalledProgram]) -> Vec<ProgramMatchRule> {
             })
         })
         .collect()
+}
+
+fn is_generic_install_location(location: &str) -> bool {
+    if location.len() <= 3 {
+        return true;
+    }
+    [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "WINDIR",
+        "SystemRoot",
+    ]
+    .iter()
+    .filter_map(|variable| std::env::var(variable).ok())
+    .map(|path| normalize_path(&path))
+    .any(|generic| location == generic)
 }
 
 fn match_program_rules(rules: &[ProgramMatchRule], executable_path: &str) -> Option<usize> {
@@ -635,6 +743,30 @@ mod tests {
         assert_eq!(
             match_program_index(&programs, r"C:\Apps\Suite\Tool\tool.exe"),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn shared_install_locations_are_not_arbitrarily_attributed() {
+        let programs = [
+            program("suite-a", "Suite A", r"C:\Apps\Shared"),
+            program("suite-b", "Suite B", r"C:\Apps\Shared"),
+        ];
+        assert_eq!(
+            match_program_index(&programs, r"C:\Apps\Shared\worker.exe"),
+            None
+        );
+    }
+
+    #[test]
+    fn generic_install_roots_do_not_claim_every_process_below_them() {
+        let Some(program_files) = std::env::var("ProgramFiles").ok() else {
+            return;
+        };
+        let programs = [program("generic", "Generic", &program_files)];
+        assert_eq!(
+            match_program_index(&programs, &format!(r"{program_files}\Unrelated\worker.exe")),
+            None
         );
     }
 

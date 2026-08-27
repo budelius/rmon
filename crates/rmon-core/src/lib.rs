@@ -43,7 +43,8 @@ pub use proc_events::{RecentExit, ShortLivedWatcher};
 pub use programs::{
     InstalledProgram, InstalledProgramsScan, ProcessProgramLink, ProgramActivity,
     ProgramAttribution, ProgramRelationship, ProgramScope, attribute_processes,
-    list_installed_programs, process_attention_reasons, program_relationships,
+    list_installed_programs, load_program_usage, process_attention_reasons, program_relationships,
+    save_program_usage,
 };
 pub use sampler::Sampler;
 pub use sensors::{

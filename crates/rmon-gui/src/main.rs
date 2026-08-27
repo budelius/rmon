@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use credentials::CredentialsEditor;
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
@@ -21,8 +22,8 @@ use rmon_core::{
     InstalledProgramsScan, OpenFilesScan, PortEntry, ProcessSample, ProgramAttribution,
     ProgramRelationship, RollingHistory, ShortLivedWatcher, Store, SystemMetrics, ThrottleHistory,
     attribute_processes, build_tree, check_hardware_health, list_installed_programs,
-    list_open_files, list_open_files_many, listening_ports_for, merge_recent_exits,
-    process_attention_reasons, program_relationships,
+    list_open_files, list_open_files_many, listening_ports_for, load_program_usage,
+    merge_recent_exits, process_attention_reasons, program_relationships, save_program_usage,
 };
 use sampling::{BackgroundSampler, IntervalChoice, Tick};
 use tray::{Tray, TrayAction};
@@ -46,6 +47,8 @@ const TRENDS_INTERVAL: Duration = Duration::from_secs(30);
 /// of CPU sampling; keeping it slower matters on machines with thousands of
 /// processes and hundreds of uninstall entries.
 const PROGRAM_ACTIVITY_INTERVAL: Duration = Duration::from_secs(3);
+const PROGRAM_USAGE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+const PROGRAM_RECENT_USE_DAYS: i64 = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortMetric {
@@ -122,6 +125,24 @@ fn format_bytes(b: u64) -> String {
         format!("{:.2} GiB", b / GIB)
     } else {
         format!("{:.0} MiB", b / MIB)
+    }
+}
+
+fn format_last_observed(at: Option<DateTime<Utc>>) -> String {
+    let Some(at) = at else {
+        return "never".to_string();
+    };
+    let age = Utc::now().signed_duration_since(at).num_seconds().max(0);
+    if age < 60 {
+        "now".to_string()
+    } else if age < 3_600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3_600)
+    } else if age < 7 * 86_400 {
+        format!("{}d ago", age / 86_400)
+    } else {
+        at.format("%Y-%m-%d").to_string()
     }
 }
 
@@ -496,14 +517,33 @@ impl AnalyzeState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgramSortColumn {
+    Name,
+    Processes,
+    Cpu,
+    Gpu,
+    Memory,
+    LastObserved,
+}
+
 struct ProgramListRow {
     id: String,
     name: String,
     version: Option<String>,
+    publisher: Option<String>,
     active: bool,
     observed: bool,
     process_count: usize,
     cpu_percent: f32,
+    gpu_percent: f32,
+    memory_bytes: u64,
+    last_observed: Option<DateTime<Utc>>,
+}
+
+struct ProgramsLoad {
+    scan: InstalledProgramsScan,
+    last_observed: HashMap<String, DateTime<Utc>>,
 }
 
 /// Installed-program inventory is loaded only when its tab is first opened.
@@ -511,7 +551,7 @@ struct ProgramListRow {
 /// thread preserves the same no-blocking rule as health/file scans.
 struct ProgramsState {
     scan: Option<InstalledProgramsScan>,
-    rx: Option<mpsc::Receiver<InstalledProgramsScan>>,
+    rx: Option<mpsc::Receiver<ProgramsLoad>>,
     attribution: ProgramAttribution,
     activity_at: Option<Instant>,
     relationships: Vec<ProgramRelationship>,
@@ -519,8 +559,15 @@ struct ProgramsState {
     /// has been observed since this inventory was loaded. This is explicitly
     /// session evidence, not a Windows-wide "last used" timestamp.
     observed_ids: HashSet<String>,
+    last_observed: HashMap<String, DateTime<Utc>>,
+    usage_dirty: bool,
+    usage_saved_at: Instant,
+    usage_save_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    usage_error: Option<String>,
     selected_id: Option<String>,
     filter: String,
+    sort_column: ProgramSortColumn,
+    sort_ascending: bool,
     active_only: bool,
     review_only: bool,
     include_system: bool,
@@ -535,8 +582,15 @@ impl ProgramsState {
             activity_at: None,
             relationships: Vec::new(),
             observed_ids: HashSet::new(),
+            last_observed: HashMap::new(),
+            usage_dirty: false,
+            usage_saved_at: Instant::now() - PROGRAM_USAGE_SAVE_INTERVAL,
+            usage_save_rx: None,
+            usage_error: None,
             selected_id: None,
             filter: String::new(),
+            sort_column: ProgramSortColumn::Cpu,
+            sort_ascending: false,
             active_only: false,
             review_only: false,
             include_system: false,
@@ -550,7 +604,19 @@ impl ProgramsState {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let _ = tx.send(list_installed_programs());
+            let mut scan = list_installed_programs();
+            let usage = match load_program_usage() {
+                Ok(usage) => usage,
+                Err(error) => {
+                    scan.warnings
+                        .push(format!("could not load last-observed history: {error:#}"));
+                    HashMap::new()
+                }
+            };
+            let _ = tx.send(ProgramsLoad {
+                scan,
+                last_observed: usage,
+            });
         });
     }
 
@@ -559,7 +625,17 @@ impl ProgramsState {
     fn poll(&mut self) -> bool {
         let Some(rx) = &self.rx else { return false };
         match rx.try_recv() {
-            Ok(scan) => {
+            Ok(ProgramsLoad {
+                scan,
+                last_observed: mut usage,
+            }) => {
+                let ids: HashSet<_> = scan
+                    .programs
+                    .iter()
+                    .map(|program| program.id.as_str())
+                    .collect();
+                usage.retain(|id, _| ids.contains(id.as_str()));
+                self.last_observed = usage;
                 self.relationships = program_relationships(&scan.programs);
                 self.activity_at = None;
                 if self.selected_id.is_none() {
@@ -596,13 +672,54 @@ impl ProgramsState {
         }
         self.attribution = attribute_processes(&scan.programs, processes);
         self.activity_at = Some(Instant::now());
-        self.observed_ids.extend(
-            self.attribution
-                .activities
-                .iter()
-                .filter(|activity| activity.active())
-                .map(|activity| activity.program_id.clone()),
-        );
+        let now = Utc::now();
+        for activity in self
+            .attribution
+            .activities
+            .iter()
+            .filter(|activity| activity.active())
+        {
+            self.observed_ids.insert(activity.program_id.clone());
+            self.last_observed.insert(activity.program_id.clone(), now);
+            self.usage_dirty = true;
+        }
+    }
+
+    fn poll_usage_save(&mut self) {
+        if let Some(rx) = &self.usage_save_rx {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.usage_save_rx = None;
+                    self.usage_error = None;
+                }
+                Ok(Err(error)) => {
+                    self.usage_save_rx = None;
+                    self.usage_dirty = true;
+                    self.usage_error = Some(error);
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.usage_save_rx = None;
+                    self.usage_dirty = true;
+                }
+            }
+        }
+        if !self.usage_dirty
+            || self.usage_save_rx.is_some()
+            || self.usage_saved_at.elapsed() < PROGRAM_USAGE_SAVE_INTERVAL
+        {
+            return;
+        }
+
+        let observations = self.last_observed.clone();
+        let (tx, rx) = mpsc::channel();
+        self.usage_save_rx = Some(rx);
+        self.usage_dirty = false;
+        self.usage_saved_at = Instant::now();
+        std::thread::spawn(move || {
+            let result = save_program_usage(&observations).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(result);
+        });
     }
 
     fn activity(&self, id: &str) -> Option<&rmon_core::ProgramActivity> {
@@ -610,6 +727,15 @@ impl ProgramsState {
             .activities
             .iter()
             .find(|activity| activity.program_id == id)
+    }
+
+    fn apply_sort(&mut self, column: ProgramSortColumn) {
+        if self.sort_column == column {
+            self.sort_ascending = !self.sort_ascending;
+        } else {
+            self.sort_column = column;
+            self.sort_ascending = matches!(column, ProgramSortColumn::Name);
+        }
     }
 }
 
@@ -1119,12 +1245,19 @@ fn program_removal_blockers(
     relationships: &[ProgramRelationship],
     activity: Option<&rmon_core::ProgramActivity>,
     observed_this_session: bool,
+    last_observed: Option<DateTime<Utc>>,
 ) -> Vec<String> {
     let mut blockers = Vec::new();
     if activity.is_some_and(rmon_core::ProgramActivity::active) {
         blockers.push("the program or a descendant it launched is running now".to_string());
     } else if observed_this_session {
         blockers.push("it was observed running earlier in this rMon session".to_string());
+    } else if last_observed
+        .is_some_and(|at| Utc::now().signed_duration_since(at).num_days() < PROGRAM_RECENT_USE_DAYS)
+    {
+        blockers.push(format!(
+            "rMon observed it within the last {PROGRAM_RECENT_USE_DAYS} days"
+        ));
     }
     if relationships
         .iter()
@@ -1197,6 +1330,7 @@ impl eframe::App for RmonApp {
                 .unwrap_or_default();
             self.programs.refresh_activity(&processes);
         }
+        self.programs.poll_usage_save();
 
         about::window(ui.ctx(), &mut self.about_open);
 
@@ -1515,11 +1649,13 @@ impl RmonApp {
                 let activity = self.programs.activity(&program.id);
                 let active = activity.is_some_and(rmon_core::ProgramActivity::active);
                 let observed = self.programs.observed_ids.contains(&program.id);
+                let last_observed = self.programs.last_observed.get(&program.id).copied();
                 let reviewable = program_removal_blockers(
                     program,
                     &self.programs.relationships,
                     activity,
                     observed,
+                    last_observed,
                 )
                 .is_empty();
                 if (self.programs.active_only && !active)
@@ -1531,76 +1667,209 @@ impl RmonApp {
                     id: program.id.clone(),
                     name: program.name.clone(),
                     version: program.version.clone(),
+                    publisher: program.publisher.clone(),
                     active,
                     observed,
                     process_count: activity.map_or(0, rmon_core::ProgramActivity::process_count),
                     cpu_percent: activity.map_or(0.0, |activity| activity.cpu_percent),
+                    gpu_percent: activity.map_or(0.0, |activity| activity.gpu_percent),
+                    memory_bytes: activity.map_or(0, |activity| activity.memory_bytes),
+                    last_observed,
                 })
             })
             .collect();
+
+        let sort_column = self.programs.sort_column;
+        let sort_ascending = self.programs.sort_ascending;
         visible.sort_by(|a, b| {
-            b.active.cmp(&a.active).then_with(|| {
+            let order = match sort_column {
+                ProgramSortColumn::Name => a
+                    .name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase()),
+                ProgramSortColumn::Processes => a.process_count.cmp(&b.process_count),
+                ProgramSortColumn::Cpu => a.cpu_percent.total_cmp(&b.cpu_percent),
+                ProgramSortColumn::Gpu => a.gpu_percent.total_cmp(&b.gpu_percent),
+                ProgramSortColumn::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+                ProgramSortColumn::LastObserved => a.last_observed.cmp(&b.last_observed),
+            };
+            let order = if sort_ascending {
+                order
+            } else {
+                order.reverse()
+            };
+            order.then_with(|| {
                 a.name
                     .to_ascii_lowercase()
                     .cmp(&b.name.to_ascii_lowercase())
             })
         });
 
+        let inventory_count = scan.programs.len();
+        let warnings = scan.warnings.clone();
         ui.label(format!(
-            "{} shown · {} inventory entries",
-            visible.len(),
-            scan.programs.len()
+            "{} shown · {inventory_count} inventory entries",
+            visible.len()
         ));
-        ui.weak("active totals include child processes launched by the app");
+        ui.weak(
+            "click a header to sort · load is inclusive of child processes launched by the app",
+        );
+        ui.weak(
+            "Last seen is persisted when rMon observes a process; ‘never’ means not observed by rMon, not unused.",
+        );
+
+        use egui_extras::{Column, TableBuilder};
+        let mut header_click = None;
         let mut selected = None;
-        egui::ScrollArea::vertical()
-            .id_salt("installed-program-list")
-            .show(ui, |ui| {
-                for row in &visible {
-                    let status = if row.active {
-                        format!("● {} proc · {:.1}% CPU", row.process_count, row.cpu_percent)
-                    } else if row.observed {
-                        "seen this session".to_string()
-                    } else {
-                        "not observed this session".to_string()
-                    };
-                    let text = format!(
-                        "{}{}\n  {status}",
-                        row.name,
-                        row.version
-                            .as_deref()
-                            .map(|version| format!("  {version}"))
-                            .unwrap_or_default(),
-                    );
-                    let response = ui.selectable_label(
-                        self.programs.selected_id.as_deref() == Some(row.id.as_str()),
-                        text,
-                    );
-                    if row.active {
-                        let dot = egui::Rect::from_center_size(
-                            response.rect.left_center() + egui::vec2(4.0, 0.0),
-                            egui::vec2(4.0, 4.0),
-                        );
-                        ui.painter().rect_filled(dot, 2.0, OK_COLOR);
+        TableBuilder::new(ui)
+            .id_salt("installed-program-table")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .column(Column::remainder().at_least(110.0).resizable(true))
+            .column(Column::initial(42.0).range(36.0..=70.0).resizable(true))
+            .column(Column::initial(54.0).range(46.0..=90.0).resizable(true))
+            .column(Column::initial(54.0).range(46.0..=90.0).resizable(true))
+            .column(Column::initial(70.0).range(58.0..=120.0).resizable(true))
+            .column(Column::initial(92.0).range(72.0..=150.0).resizable(true))
+            .header(22.0, |mut header| {
+                header.col(|ui| {
+                    if sort_header(
+                        ui,
+                        "Program",
+                        sort_column == ProgramSortColumn::Name,
+                        sort_ascending,
+                    ) {
+                        header_click = Some(ProgramSortColumn::Name);
                     }
-                    if response.clicked() {
+                });
+                header.col(|ui| {
+                    if sort_header(
+                        ui,
+                        "#",
+                        sort_column == ProgramSortColumn::Processes,
+                        sort_ascending,
+                    ) {
+                        header_click = Some(ProgramSortColumn::Processes);
+                    }
+                });
+                header.col(|ui| {
+                    if sort_header(
+                        ui,
+                        "CPU%",
+                        sort_column == ProgramSortColumn::Cpu,
+                        sort_ascending,
+                    ) {
+                        header_click = Some(ProgramSortColumn::Cpu);
+                    }
+                });
+                header.col(|ui| {
+                    if sort_header(
+                        ui,
+                        "GPU%",
+                        sort_column == ProgramSortColumn::Gpu,
+                        sort_ascending,
+                    ) {
+                        header_click = Some(ProgramSortColumn::Gpu);
+                    }
+                });
+                header.col(|ui| {
+                    if sort_header(
+                        ui,
+                        "Memory",
+                        sort_column == ProgramSortColumn::Memory,
+                        sort_ascending,
+                    ) {
+                        header_click = Some(ProgramSortColumn::Memory);
+                    }
+                });
+                header.col(|ui| {
+                    if sort_header(
+                        ui,
+                        "Last seen",
+                        sort_column == ProgramSortColumn::LastObserved,
+                        sort_ascending,
+                    ) {
+                        header_click = Some(ProgramSortColumn::LastObserved);
+                    }
+                });
+            })
+            .body(|body| {
+                body.rows(36.0, visible.len(), |mut table_row| {
+                    let row = &visible[table_row.index()];
+                    table_row.set_selected(
+                        self.programs.selected_id.as_deref() == Some(row.id.as_str()),
+                    );
+                    table_row.col(|ui| {
+                        ui.horizontal(|ui| {
+                            let color = if row.active {
+                                OK_COLOR
+                            } else if row.observed {
+                                WARN_COLOR
+                            } else {
+                                UNKNOWN_COLOR
+                            };
+                            ui.colored_label(color, "●").on_hover_text(if row.active {
+                                "active now"
+                            } else if row.observed {
+                                "observed earlier"
+                            } else {
+                                "not observed by rMon"
+                            });
+                            ui.vertical(|ui| {
+                                ui.label(&row.name);
+                                let metadata =
+                                    match (row.version.as_deref(), row.publisher.as_deref()) {
+                                        (Some(version), Some(publisher)) => {
+                                            format!("{version} · {publisher}")
+                                        }
+                                        (Some(version), None) => version.to_string(),
+                                        (None, Some(publisher)) => publisher.to_string(),
+                                        (None, None) => "metadata not recorded".to_string(),
+                                    };
+                                ui.label(egui::RichText::new(metadata).small().weak());
+                            });
+                        });
+                    });
+                    table_row.col(|ui| {
+                        ui.label(row.process_count.to_string());
+                    });
+                    table_row.col(|ui| {
+                        ui.label(format!("{:.1}", row.cpu_percent));
+                    });
+                    table_row.col(|ui| {
+                        ui.label(format!("{:.1}", row.gpu_percent));
+                    });
+                    table_row.col(|ui| {
+                        ui.label(if row.memory_bytes == 0 {
+                            "—".to_string()
+                        } else {
+                            format_bytes(row.memory_bytes)
+                        });
+                    });
+                    table_row.col(|ui| {
+                        ui.label(format_last_observed(row.last_observed));
+                    });
+                    if table_row.response().clicked() {
                         selected = Some(row.id.clone());
                     }
-                }
+                });
             });
         if let Some(id) = selected {
             self.programs.selected_id = Some(id);
         }
+        if let Some(column) = header_click {
+            self.programs.apply_sort(column);
+        }
 
-        if !scan.warnings.is_empty() {
-            ui.collapsing(
-                format!("{} inventory warning(s)", scan.warnings.len()),
-                |ui| {
-                    for warning in &scan.warnings {
-                        ui.weak(warning);
-                    }
-                },
-            );
+        if let Some(error) = &self.programs.usage_error {
+            ui.colored_label(WARN_COLOR, format!("last-observed history: {error}"));
+        }
+        if !warnings.is_empty() {
+            ui.collapsing(format!("{} inventory warning(s)", warnings.len()), |ui| {
+                for warning in &warnings {
+                    ui.weak(warning);
+                }
+            });
         }
     }
 
@@ -1622,11 +1891,13 @@ impl RmonApp {
         };
         let activity = self.programs.activity(&program.id).cloned();
         let observed = self.programs.observed_ids.contains(&program.id);
+        let last_observed = self.programs.last_observed.get(&program.id).copied();
         let blockers = program_removal_blockers(
             &program,
             &self.programs.relationships,
             activity.as_ref(),
             observed,
+            last_observed,
         );
 
         ui.heading(&program.name);
@@ -1693,6 +1964,14 @@ impl RmonApp {
                 ui.weak("this is not a system-wide last-used timestamp and does not mean unused");
             }
         }
+        match last_observed {
+            Some(at) => ui.label(format!(
+                "last observed: {} ({})",
+                at.format("%Y-%m-%d %H:%M:%S UTC"),
+                format_last_observed(Some(at))
+            )),
+            None => ui.weak("last observed: never recorded by rMon"),
+        };
 
         ui.add_space(8.0);
         ui.separator();
@@ -1881,9 +2160,17 @@ impl RmonApp {
     }
 
     fn ask_program_diagnosis(&mut self, program: &InstalledProgram) {
+        let last_observed = self
+            .programs
+            .last_observed
+            .get(&program.id)
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_else(|| "never observed by rMon".to_string());
         self.analyze.input = format!(
-            "Explain and assess the installed program {:?} (inventory id {:?}). Use program_detail. \
-             Tell me what it is normally used for, what rMon actually observes it doing now, which \
+            "Explain and assess the installed program {:?} (inventory id {:?}). rMon's persisted \
+             last observation is {last_observed:?}; that is rMon evidence, not a Windows last-used \
+             timestamp. Use program_detail. Tell me what it is normally used for, what rMon actually \
+             observes it doing now, which \
              parent/child processes and known dependents it has, any concrete suspicious indicators \
              versus merely missing evidence, read-only verification commands, and whether it is only \
              a candidate to review for uninstall. Do not call it safe to uninstall when usage or \

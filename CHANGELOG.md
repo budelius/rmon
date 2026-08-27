@@ -63,17 +63,21 @@ that does not depend on remembering what you installed.
 
 - New **programs** tab and `rmon programs` command inventory conventional
   Win32/MSI installs from all per-user/per-machine 32/64-bit Uninstall
-  registry views.
+  registry views. The GUI uses a searchable table sortable by name, process
+  count, inclusive CPU/GPU load, memory, and last observation.
 - Full executable paths associate running processes with install locations;
   parent chains expose launched children and inclusive resources, so a
   launcher such as Warp can show that it started `find.exe`.
 - Known installer parent/dependent entries stay distinct from observed
   process parentage. rMon says explicitly that Windows does not expose a
   universal Win32 dependency graph or reliable last-used timestamp.
-- Conservative **removal review** excludes active/session-observed software,
-  system components, updates, entries without uninstallers, and entries with
-  known dependents. Results are candidates to investigate, never “safe.”
-  rMon does not run uninstall commands.
+- **Last seen** persists the time rMon last observed an attributable process;
+  it is explicitly not presented as a Windows last-used timestamp, and
+  `never` means “not observed by rMon,” not “unused.”
+- Conservative **removal review** excludes active/session-observed or recently
+  observed software, system components, updates, entries without uninstallers,
+  and entries with known dependents. Results are candidates to investigate,
+  never “safe.” rMon does not run uninstall commands.
 - Process and program details can ask Analyze for a purpose/suspicion/removal
   assessment. The model receives paths, publisher metadata, command lines,
   process lineage, and measured resources, and is told to separate evidence
