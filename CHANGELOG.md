@@ -57,6 +57,16 @@ that does not depend on remembering what you installed.
   `Error`, matching what a caller asking "did this machine report a hardware
   fault" means.
 
+### WMI cannot become a hidden sensor cost
+
+- The ACPI temperature fallback no longer opens `ROOT\\WMI` during sampler
+  construction. It connects lazily only after direct MSR, Super I/O, and
+  HWiNFO sources all fail, so a machine with direct sensors never touches WMI.
+- ACPI refreshes at most every 30 seconds, abandons unsupported firmware after
+  three attempts, and permanently disconnects a fallback query that takes
+  over 250ms. A pathological provider can cost one reading, not sustained
+  `WmiPrvSE.exe` load.
+
 ## 0.2.0 — 2026-08-25
 
 ### Installed programs, provenance, and software diagnosis

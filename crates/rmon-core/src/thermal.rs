@@ -30,10 +30,11 @@
 //!
 //! - Clock ratio comes from `CallNtPowerInformation`, one syscall against
 //!   state the kernel already maintains. No WMI at all.
-//! - The ACPI thermal zone is queried only when it is the source we would
-//!   actually display — never when the MSR or HWiNFO path already answered
-//!   — and gives up permanently once the class proves unsupported, which
-//!   is a fixed property of the machine rather than a transient failure.
+//! - The ACPI WMI connection is created lazily, only when it is the source
+//!   we would actually display — never when the MSR, Super I/O, or HWiNFO
+//!   path already answered. It gives up permanently once the class proves
+//!   unsupported or a query is pathologically slow, which prevents a bad
+//!   provider from turning a fallback sensor into sustained machine load.
 
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,11 @@ use crate::sensors::PackageThermal;
 /// returns the cached reading. (The HWiNFO shared-memory path is a plain
 /// memory read and stays per-tick, as does the clock ratio now that it no
 /// longer goes through WMI.)
-const WMI_REFRESH: Duration = Duration::from_secs(5);
+const WMI_REFRESH: Duration = Duration::from_secs(30);
+/// A fallback temperature query taking longer than this is more expensive
+/// than its approximate reading is worth. Return that reading once if one
+/// arrived, but disconnect the provider so it cannot become recurring load.
+const ACPI_MAX_QUERY_COST: Duration = Duration::from_millis(250);
 
 /// How many consecutive failed ACPI thermal zone queries before the source
 /// is abandoned for the life of the process.
@@ -93,8 +98,11 @@ pub struct CpuThermalSample {
 }
 
 pub struct CpuThermalMonitor {
-    /// `None` once the ACPI thermal zone has been ruled out — either it
-    /// was never reachable, or it failed [`ACPI_MAX_STRIKES`] times.
+    /// False until every stronger source has failed and ACPI is actually
+    /// needed. This keeps a machine with direct sensors entirely out of WMI.
+    acpi_initialized: bool,
+    /// `None` before lazy initialization and once the ACPI thermal zone has
+    /// been ruled out — unreachable, repeatedly unusable, or too expensive.
     acpi: Option<WMIConnection>,
     acpi_strikes: u8,
     last_acpi_query: Option<Instant>,
@@ -106,14 +114,12 @@ pub struct CpuThermalMonitor {
 
 impl CpuThermalMonitor {
     pub fn new() -> Self {
-        let acpi = WMIConnection::with_namespace_path(r"ROOT\WMI")
-            .inspect_err(|e| log::info!("ACPI thermal zone WMI unavailable: {e:#}"))
-            .ok();
         // SAFETY: no arguments beyond a constant; the call only reads
         // kernel-maintained topology.
         let cpu_count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
         Self {
-            acpi,
+            acpi_initialized: false,
+            acpi: None,
             acpi_strikes: 0,
             last_acpi_query: None,
             cached_acpi_temp: None,
@@ -225,15 +231,26 @@ impl CpuThermalMonitor {
         let due = self
             .last_acpi_query
             .is_none_or(|t| t.elapsed() >= WMI_REFRESH);
-        let Some(conn) = self.acpi.as_ref().filter(|_| due) else {
+        if !due {
+            return self.cached_acpi_temp;
+        }
+        if !self.acpi_initialized {
+            self.acpi_initialized = true;
+            self.acpi = WMIConnection::with_namespace_path(r"ROOT\WMI")
+                .inspect_err(|e| log::info!("ACPI thermal zone WMI unavailable: {e:#}"))
+                .ok();
+        }
+        let Some(conn) = self.acpi.as_ref() else {
             return self.cached_acpi_temp;
         };
         self.last_acpi_query = Some(Instant::now());
 
+        let query_started = Instant::now();
         let rows: Option<Vec<AcpiThermalZone>> = conn
             .raw_query("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
             .inspect_err(|e| log::debug!("ACPI thermal zone query failed: {e:#}"))
             .ok();
+        let query_cost = query_started.elapsed();
         let reading = rows.and_then(|rows| {
             average(
                 rows.iter()
@@ -259,6 +276,10 @@ impl CpuThermalMonitor {
             }
         }
         self.cached_acpi_temp = reading;
+        if query_cost > ACPI_MAX_QUERY_COST {
+            log::warn!("ACPI thermal zone query took {query_cost:?}; disabling this WMI fallback");
+            self.acpi = None;
+        }
         reading
     }
 }
@@ -316,28 +337,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acpi_wmi_is_lazy() {
+        let monitor = CpuThermalMonitor::new();
+        assert!(!monitor.acpi_initialized);
+        assert!(monitor.acpi.is_none());
+    }
+
     /// A machine whose firmware has no thermal zone must stop asking.
-    /// Without this the query is reissued every 5s forever, which is what
-    /// filled the WMI-Activity log on the machine that prompted the fix.
+    /// Without this the query is reissued forever, which is what filled the
+    /// WMI-Activity log on the machine that prompted the fix.
     #[test]
     fn acpi_gives_up_after_repeated_failures() {
         let mut monitor = CpuThermalMonitor::new();
-        if monitor.acpi.is_none() {
-            return; // already ruled out at construction; nothing to prove
-        }
         for _ in 0..ACPI_MAX_STRIKES {
             monitor.last_acpi_query = None; // defeat the refresh interval
             monitor.acpi_temp();
+            if monitor.acpi_initialized && monitor.acpi.is_none() {
+                break;
+            }
         }
         println!(
             "after {ACPI_MAX_STRIKES} attempts: acpi_dropped={} reading={:?}",
             monitor.acpi.is_none(),
             monitor.cached_acpi_temp
         );
-        assert_eq!(
-            monitor.acpi.is_none(),
-            monitor.cached_acpi_temp.is_none(),
-            "the connection must be dropped exactly when the source never answered"
-        );
+        assert!(monitor.acpi_initialized);
+        if monitor.cached_acpi_temp.is_none() {
+            assert!(
+                monitor.acpi.is_none(),
+                "an ACPI source that never answered must be dropped"
+            );
+        }
     }
 }

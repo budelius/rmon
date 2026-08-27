@@ -364,10 +364,13 @@ also moved to. Sources are tried strongest first:
    sensor tree is separate and off by default until explicitly enabled for
    the session.
 4. **ACPI thermal zone** (`MSAcpi_ThermalZoneTemperature` over WMI) plus
-   the kernel's processor-power clock ratio. On many machines the zone is
-   absent, inaccurate, or not measuring the CPU package at all, and "throttled" here
-   is only an inference from clocks running below the rated maximum under
-   load — shown as "likely throttled", with the cause unconfirmed.
+   the kernel's processor-power clock ratio. The WMI connection is lazy (it
+   is never opened when a stronger source answered), refreshes at most every
+   30s, and is permanently dropped if unsupported or a query costs over
+   250ms. On many machines the zone is absent, inaccurate, or not measuring
+   the CPU package at all, and "throttled" here is only an inference from
+   clocks running below the rated maximum under load — shown as "likely
+   throttled", with the cause unconfirmed.
 
 **GPU** telemetry is separate and needs no driver: NVML reports per-GPU
 temperature and whether an unambiguous thermal slowdown
