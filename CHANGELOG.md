@@ -5,7 +5,7 @@ the section matching the version you are running, alongside the commit and
 build time of the running binary, so "am I on the latest?" has an answer
 that does not depend on remembering what you installed.
 
-## Unreleased
+## 0.3.0 — 2026-08-28
 
 ### CPU percentages say which percentage they are
 
@@ -57,6 +57,31 @@ that does not depend on remembering what you installed.
   `Error`, matching what a caller asking "did this machine report a hardware
   fault" means.
 
+### Installed programs remember what they saw
+
+- **Last seen** persists the time rMon last observed a process attributable
+  to each program, in `%APPDATA%\rMon\program-usage.json` (program ids and
+  timestamps only — no command lines or paths). Removal review now excludes
+  anything seen in the last 30 days rather than only what is running right
+  now, which was a much weaker claim than it looked.
+- This is rMon's own observation history and says so everywhere it appears.
+  Windows exposes no reliable last-used timestamp, so `never` means “not
+  observed by rMon,” never “unused” or “safe to uninstall.”
+- Programs sharing an install location (Office components being the usual
+  case) no longer have an executable assigned to whichever uninstall entry
+  sorted first — a coin flip presented as a fact. Ambiguous location and
+  `DisplayIcon` rules are dropped, and bare roots like `%ProgramFiles%` never
+  become rules at all, so an ambiguous executable is left unattributed
+  instead of attributed wrongly.
+- The GUI programs tab is a searchable table sortable by name, process count,
+  inclusive CPU/GPU load, memory, or last seen.
+
+### The bundled MCP config points at the installed binary
+
+- `.mcp.json` shipped a path into `~/.cargo/bin`, which only exists on a
+  machine that ran `cargo install`. Anyone using the MSI got an MCP server
+  that silently failed to start.
+
 ### WMI cannot become a hidden sensor cost
 
 - The ACPI temperature fallback no longer opens `ROOT\\WMI` during sampler
@@ -73,21 +98,17 @@ that does not depend on remembering what you installed.
 
 - New **programs** tab and `rmon programs` command inventory conventional
   Win32/MSI installs from all per-user/per-machine 32/64-bit Uninstall
-  registry views. The GUI uses a searchable table sortable by name, process
-  count, inclusive CPU/GPU load, memory, and last observation.
+  registry views.
 - Full executable paths associate running processes with install locations;
   parent chains expose launched children and inclusive resources, so a
   launcher such as Warp can show that it started `find.exe`.
 - Known installer parent/dependent entries stay distinct from observed
   process parentage. rMon says explicitly that Windows does not expose a
   universal Win32 dependency graph or reliable last-used timestamp.
-- **Last seen** persists the time rMon last observed an attributable process;
-  it is explicitly not presented as a Windows last-used timestamp, and
-  `never` means “not observed by rMon,” not “unused.”
-- Conservative **removal review** excludes active/session-observed or recently
-  observed software, system components, updates, entries without uninstallers,
-  and entries with known dependents. Results are candidates to investigate,
-  never “safe.” rMon does not run uninstall commands.
+- Conservative **removal review** excludes active/session-observed software,
+  system components, updates, entries without uninstallers, and entries with
+  known dependents. Results are candidates to investigate, never “safe.”
+  rMon does not run uninstall commands.
 - Process and program details can ask Analyze for a purpose/suspicion/removal
   assessment. The model receives paths, publisher metadata, command lines,
   process lineage, and measured resources, and is told to separate evidence

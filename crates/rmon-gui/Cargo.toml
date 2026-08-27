@@ -16,8 +16,8 @@ chrono = "0.4.45"
 eframe = { version = "0.35.0", features = ["persistence"] }
 egui_extras = "0.35.0"
 egui_plot = "0.36.0"
-rmon-agent = { version = "0.2.0", path = "../rmon-agent" }
-rmon-core = { version = "0.2.0", path = "../rmon-core" }
+rmon-agent = { version = "0.3.0", path = "../rmon-agent" }
+rmon-core = { version = "0.3.0", path = "../rmon-core" }
 tray-icon = "0.24.1"
 winreg = "0.56.0"
 

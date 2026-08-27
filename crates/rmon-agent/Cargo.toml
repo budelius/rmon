@@ -9,7 +9,7 @@ description = "LLM agent core for analysing rMon's performance telemetry"
 anyhow = "1.0.104"
 log = "0.4.33"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-rmon-core = { version = "0.2.0", path = "../rmon-core" }
+rmon-core = { version = "0.3.0", path = "../rmon-core" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4.45"

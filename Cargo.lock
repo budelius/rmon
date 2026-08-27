@@ -5083,7 +5083,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5096,7 +5096,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5114,7 +5114,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5136,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5153,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "rmon-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
