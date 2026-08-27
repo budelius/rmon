@@ -2,7 +2,7 @@
   "mcpServers": {
     "rmon": {
       "type": "stdio",
-      "command": "C:\\Users\\budel\\.cargo\\bin\\rmon.exe",
+      "command": "C:/Program Files/rMon/bin/rmon.exe",
       "args": [
         "mcp"
       ],
