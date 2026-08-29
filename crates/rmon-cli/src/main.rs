@@ -906,10 +906,17 @@ fn run_wmi(secs: i64, max_events: usize, top: usize, trace: Option<String>) -> R
             if enable { "enabled" } else { "disabled" }
         );
         if enable {
+            // An analytic channel is write-only while it records, so the
+            // obvious next move ("read it now") does not work and saying
+            // so here saves a confusing empty result.
             println!(
-                "Every WMI operation on this machine is now logged. Re-run `rmon wmi` in a \
-                 minute to see who is calling, then turn it back off with `--trace off`."
+                "Every WMI operation on this machine is now being recorded — but an analytic \
+                 channel cannot be read while it records. Let the load reproduce, then:"
             );
+            println!("    rmon wmi --trace off    # stop recording, which makes it readable");
+            println!("    rmon wmi                # read what it captured");
+        } else {
+            println!("The captured trace is now readable — run `rmon wmi` to see the callers.");
         }
         return Ok(());
     }
@@ -966,6 +973,9 @@ fn run_wmi(secs: i64, max_events: usize, top: usize, trace: Option<String>) -> R
 
     if let Some(warning) = &report.sampling_warning {
         println!("\n{warning}");
+    }
+    if let Some(err) = &report.trace_read_error {
+        println!("(the full trace was not read: {err})");
     }
     Ok(())
 }

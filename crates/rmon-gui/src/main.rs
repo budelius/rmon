@@ -4045,6 +4045,12 @@ impl RmonApp {
                     ui.add_space(4.0);
                     ui.colored_label(WARN_COLOR, warning);
                 }
+                if let Some(err) = &report.trace_read_error {
+                    // Without this, a result silently narrowed by
+                    // permissions looks exactly like a complete one.
+                    ui.add_space(2.0);
+                    ui.weak(format!("The full trace was not read: {err}"));
+                }
                 ui.add_space(8.0);
 
                 if report.clients.is_empty() {

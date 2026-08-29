@@ -29,6 +29,23 @@
 //!   and costs log volume, so it is opt-in and meant to be turned back off —
 //!   see [`set_trace_enabled`].
 //!
+//! # Tracing is capture-then-read, and reading it needs elevation
+//!
+//! Measured on Windows 11, not assumed: the analytic channel refuses a
+//! query by *channel path* with "the request is not supported" whether it
+//! is recording or not. Its events are only reachable through the backing
+//! `Microsoft-Windows-WMI-Activity%4Trace.evtx` under
+//! `%SystemRoot%\System32\Winevt\Logs`, so [`read_channel`] queries that
+//! file directly — and because that directory is not user-readable, a
+//! non-elevated read gets nothing and quietly falls back to the sampled
+//! channel.
+//!
+//! The practical consequence is that tracing is capture-then-read rather
+//! than live: enable, let the load reproduce, disable, then read. So
+//! [`sampling_warning`] separates "tracing is off" from "tracing is on but
+//! nothing traced was readable" — telling someone to enable a channel that
+//! is already recording would send them in a circle.
+//!
 //! # Naming callers that already exited
 //!
 //! The interesting clients are often short-lived: they run one enumeration
@@ -45,7 +62,8 @@ use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EVT_VARIANT, EvtChannelConfigEnabled, EvtClose, EvtGetChannelConfigProperty,
-    EvtNext, EvtOpenChannelConfig, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection,
+    EvtChannelLoggingConfigLogFilePath, EvtNext, EvtOpenChannelConfig, EvtQuery,
+    EvtQueryChannelPath, EvtQueryFilePath, EvtQueryReverseDirection,
     EvtRender, EvtRenderEventXml, EvtSaveChannelConfig, EvtSetChannelConfigProperty,
     EvtVarTypeBoolean,
 };
@@ -135,6 +153,13 @@ pub struct WmiActivityReport {
     /// Set when the operational channel was the only source, because then
     /// the ranking below is a biased sample rather than the whole truth.
     pub sampling_warning: Option<String>,
+    /// Why the complete channel contributed nothing, when it didn't.
+    ///
+    /// Almost always "Access is denied": the capture lives in an `.evtx`
+    /// under `System32\Winevt\Logs`, which needs Administrator to open.
+    /// Carried on the report rather than left in a debug log, because a
+    /// silently sampled result looks identical to a complete one.
+    pub trace_read_error: Option<String>,
 }
 
 impl WmiActivityReport {
@@ -149,7 +174,7 @@ impl WmiActivityReport {
 /// The trace channel is preferred and merged in when enabled; the
 /// operational channel is always read so there is something to show even
 /// before anyone opts in to tracing.
-pub fn read_operations(lookback_secs: i64, max_events: usize) -> Result<Vec<WmiOperation>> {
+pub fn read_operations(lookback_secs: i64, max_events: usize) -> Result<WmiRead> {
     let mut all = Vec::new();
 
     // Operational is always present; a failure to read it is worth
@@ -158,13 +183,35 @@ pub fn read_operations(lookback_secs: i64, max_events: usize) -> Result<Vec<WmiO
         Ok(mut ops) => all.append(&mut ops),
         Err(e) => log::debug!("operational channel unreadable: {e:#}"),
     }
-    if let Ok(mut ops) = read_channel(TRACE_CHANNEL, lookback_secs, max_events) {
-        all.append(&mut ops);
-    }
+    // Kept rather than swallowed: without the reason, a silently sampled
+    // result is indistinguishable from a complete one, and the usual cause
+    // (the capture file needs Administrator) is something the reader can
+    // act on.
+    let trace_read_error = match read_channel(TRACE_CHANNEL, lookback_secs, max_events) {
+        Ok(mut ops) => {
+            log::debug!("trace channel yielded {} operation(s)", ops.len());
+            all.append(&mut ops);
+            None
+        }
+        Err(e) => {
+            log::debug!("trace channel unreadable: {e:#}");
+            Some(format!("{e:#}"))
+        }
+    };
 
     all.sort_by_key(|o| std::cmp::Reverse(o.time));
     all.truncate(max_events);
-    Ok(all)
+    Ok(WmiRead {
+        operations: all,
+        trace_read_error,
+    })
+}
+
+/// What one read of the channels produced, and why the complete one did
+/// not contribute if it didn't.
+pub struct WmiRead {
+    pub operations: Vec<WmiOperation>,
+    pub trace_read_error: Option<String>,
 }
 
 /// Builds the full report, naming clients through `resolve_name`.
@@ -172,11 +219,15 @@ pub fn read_operations(lookback_secs: i64, max_events: usize) -> Result<Vec<WmiO
 /// `resolve_name` should consult the live process table *and* ETW exit
 /// history — the clients worth catching are frequently already gone.
 pub fn attribute(
-    operations: Vec<WmiOperation>,
+    read: WmiRead,
     lookback_secs: i64,
     resolve_name: impl Fn(u32) -> Option<String>,
     is_alive: impl Fn(u32) -> bool,
 ) -> WmiActivityReport {
+    let WmiRead {
+        operations,
+        trace_read_error,
+    } = read;
     let trace_channel = trace_state();
     let saw_trace = operations.iter().any(|o| o.channel == WmiChannel::Trace);
 
@@ -216,13 +267,7 @@ pub fn attribute(
         .collect();
     clients.sort_by(|a, b| b.operations.cmp(&a.operations).then_with(|| a.pid.cmp(&b.pid)));
 
-    let sampling_warning = (!saw_trace).then(|| {
-        format!(
-            "Only the operational channel was readable, and it records just the operations slow \
-             enough to cross a threshold — so these counts are a biased sample, and the busiest \
-             caller may not appear at all. Enable {TRACE_CHANNEL} to record every operation."
-        )
-    });
+    let sampling_warning = sampling_warning(saw_trace, trace_channel, trace_read_error.as_deref());
 
     WmiActivityReport {
         trace_channel,
@@ -230,7 +275,53 @@ pub fn attribute(
         operations,
         clients,
         sampling_warning,
+        trace_read_error,
     }
+}
+
+/// How far to trust the counts, in words, or `None` when they are complete.
+///
+/// Three genuinely different situations, and separating them is the
+/// difference between a useful instruction and one that sends the reader in
+/// a circle — notably, never telling someone to enable a channel that is
+/// already recording.
+pub fn sampling_warning(
+    saw_trace: bool,
+    trace_channel: ChannelState,
+    trace_read_error: Option<&str>,
+) -> Option<String> {
+    // Complete data: nothing to caveat.
+    if saw_trace {
+        return None;
+    }
+
+    let base = "The counts below come only from the operational channel, which records just \
+                the operations slow enough to cross a threshold — so they are a biased sample \
+                and the busiest caller may be missing entirely.";
+
+    // Permission is the most common reason the capture contributes nothing,
+    // and it is the one the reader can actually fix, so it outranks the
+    // channel's on/off state as an explanation.
+    if trace_read_error.is_some_and(|e| e.contains("Access is denied")) {
+        return Some(format!(
+            "{base} The full trace could not be read: its capture file lives under \
+             System32\\Winevt\\Logs and needs Administrator. Re-run rMon elevated to read it."
+        ));
+    }
+
+    Some(match trace_channel {
+        // Already recording — telling the reader to enable it would send
+        // them in a circle. The step that makes a capture readable is
+        // turning it off.
+        ChannelState::Enabled => format!(
+            "Full tracing is ON and capturing, but nothing from it was readable yet. {base} \
+             Turn tracing off to read what {TRACE_CHANNEL} captured."
+        ),
+        _ => format!(
+            "{base} Enable {TRACE_CHANNEL} to record every operation, reproduce the load, then \
+             turn it back off and read it as Administrator."
+        ),
+    })
 }
 
 /// Whether the analytic trace channel is currently enabled.
@@ -305,6 +396,64 @@ fn channel_enabled(channel: &str) -> Result<bool> {
     }
 }
 
+/// The `.evtx` a channel writes to, from its own configuration.
+///
+/// Needed because an analytic channel is never queryable by channel path —
+/// Windows answers "the request is not supported" whether it is recording
+/// or not. Its captured events are only reachable through the backing file,
+/// which also means reading them needs Administrator, since
+/// `%SystemRoot%\System32\Winevt\Logs` is not user-readable.
+fn channel_log_path(channel: &str) -> Result<String> {
+    let path = wide(channel);
+    // SAFETY: `path` outlives the call and the handle is always closed.
+    unsafe {
+        let handle = EvtOpenChannelConfig(None, PCWSTR(path.as_ptr()), 0)
+            .context("opening the channel config")?;
+        let mut used = 0u32;
+        // Size the buffer first; this call is expected to fail short.
+        let _ = EvtGetChannelConfigProperty(
+            handle,
+            EvtChannelLoggingConfigLogFilePath,
+            0,
+            0,
+            None,
+            &mut used,
+        );
+        let mut buf = vec![0u8; used.max(512) as usize];
+        let got = EvtGetChannelConfigProperty(
+            handle,
+            EvtChannelLoggingConfigLogFilePath,
+            0,
+            buf.len() as u32,
+            Some(buf.as_mut_ptr().cast()),
+            &mut used,
+        );
+        let result = got.map(|()| {
+            let variant = &*(buf.as_ptr() as *const EVT_VARIANT);
+            variant.Anonymous.StringVal.to_string().unwrap_or_default()
+        });
+        let _ = EvtClose(handle);
+        let raw = result.context("reading the channel's log file path")?;
+        Ok(expand_env(&raw))
+    }
+}
+
+/// Expands `%SystemRoot%`-style variables, which channel configs use.
+fn expand_env(path: &str) -> String {
+    let mut out = path.to_string();
+    while let Some(start) = out.find('%') {
+        let Some(len) = out[start + 1..].find('%') else {
+            break;
+        };
+        let name = &out[start + 1..start + 1 + len];
+        let Ok(value) = std::env::var(name) else {
+            break;
+        };
+        out.replace_range(start..start + len + 2, &value);
+    }
+    out
+}
+
 /// Pulls rendered events from one channel, newest first.
 fn read_channel(channel: &str, lookback_secs: i64, max_events: usize) -> Result<Vec<WmiOperation>> {
     // Server-side time filter: pushing this into the query means the log
@@ -312,13 +461,31 @@ fn read_channel(channel: &str, lookback_secs: i64, max_events: usize) -> Result<
     let ms = lookback_secs.max(0) * 1000;
     let query = format!("*[System[TimeCreated[timediff(@SystemTime) <= {ms}]]]");
 
-    let channel_w = wide(channel);
-    let query_w = wide(&query);
-    let channel_name = if channel == TRACE_CHANNEL {
+    // The analytic channel is never queryable by channel path — Windows
+    // refuses with "the request is not supported" whether it is recording
+    // or not — so it has to be read from its backing .evtx instead. That
+    // file lives under System32 and needs Administrator to open, which is
+    // why a non-elevated read silently falls back to the sampled channel.
+    let is_trace = channel == TRACE_CHANNEL;
+    let (target, flags) = if is_trace {
+        (
+            channel_log_path(channel)?,
+            EvtQueryFilePath.0 | EvtQueryReverseDirection.0,
+        )
+    } else {
+        (
+            channel.to_string(),
+            EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
+        )
+    };
+    let channel_name = if is_trace {
         WmiChannel::Trace
     } else {
         WmiChannel::Operational
     };
+
+    let channel_w = wide(&target);
+    let query_w = wide(&query);
 
     // SAFETY: both wide buffers outlive every call below, and each handle
     // (the result set and every event) is closed exactly once.
@@ -327,7 +494,7 @@ fn read_channel(channel: &str, lookback_secs: i64, max_events: usize) -> Result<
             None,
             PCWSTR(channel_w.as_ptr()),
             PCWSTR(query_w.as_ptr()),
-            EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
+            flags,
         )
         .with_context(|| format!("querying {channel}"))?;
 
@@ -539,7 +706,7 @@ mod tests {
         }
         ops.push(op_from(9, "SELECT * FROM Win32_BIOS", "0x80041010"));
 
-        let report = attribute(ops, 60, |pid| Some(format!("proc{pid}")), |pid| pid == 7);
+        let report = attribute(read_of(ops), 60, |pid| Some(format!("proc{pid}")), |pid| pid == 7);
 
         let top = report.top_client().expect("a top client");
         assert_eq!(top.pid, 7, "the busiest caller must rank first");
@@ -558,7 +725,7 @@ mod tests {
     /// enough to get logged".
     #[test]
     fn warns_when_only_the_sampled_channel_was_available() {
-        let report = attribute(vec![op_from(1, "q", "0x0")], 60, |_| None, |_| false);
+        let report = attribute(read_of(vec![op_from(1, "q", "0x0")]), 60, |_| None, |_| false);
         assert!(
             report.sampling_warning.is_some(),
             "operational-only results must carry the caveat"
@@ -566,13 +733,75 @@ mod tests {
 
         let mut traced = op_from(1, "q", "0x0");
         traced.channel = WmiChannel::Trace;
-        let report = attribute(vec![traced], 60, |_| None, |_| false);
+        let report = attribute(read_of(vec![traced]), 60, |_| None, |_| false);
         assert!(report.sampling_warning.is_none(), "trace data is complete");
+    }
+
+    /// An analytic channel cannot be read while it records, so "tracing is
+    /// on but produced nothing readable" must not tell the reader to turn
+    /// on the thing they already turned on.
+    #[test]
+    fn the_warning_never_says_to_enable_what_is_already_enabled() {
+        let warning = sampling_warning(false, ChannelState::Enabled, None)
+            .expect("recording but unreadable");
+        assert!(
+            !warning.contains("Enable "),
+            "must not ask for an already-enabled channel: {warning}"
+        );
+        assert!(
+            warning.contains("Turn tracing off"),
+            "must give the step that actually makes it readable: {warning}"
+        );
+
+        let off = sampling_warning(false, ChannelState::Disabled, None).expect("sampled only");
+        assert!(
+            off.contains("Enable "),
+            "with tracing off, enabling it is the right advice: {off}"
+        );
+
+        assert_eq!(
+            sampling_warning(true, ChannelState::Enabled, None),
+            None,
+            "trace data needs no caveat"
+        );
+        assert_eq!(
+            sampling_warning(true, ChannelState::Disabled, None),
+            None,
+            "trace events are complete whatever the channel says now"
+        );
+    }
+
+    /// The capture file needs Administrator. That is the one cause the
+    /// reader can act on, so it must outrank the channel's on/off state as
+    /// an explanation — otherwise an elevated-read problem reads as a
+    /// "you forgot to enable tracing" problem.
+    #[test]
+    fn permission_failures_are_reported_as_permission_failures() {
+        let denied = Some("querying the trace channel: Access is denied. (0x80070005)");
+
+        for state in [
+            ChannelState::Enabled,
+            ChannelState::Disabled,
+            ChannelState::Unknown,
+        ] {
+            let warning = sampling_warning(false, state, denied).expect("a warning");
+            assert!(
+                warning.contains("Administrator"),
+                "{state:?} must name the real blocker: {warning}"
+            );
+            assert!(
+                !warning.contains("Turn tracing off"),
+                "{state:?} must not blame the channel state: {warning}"
+            );
+        }
+
+        // Complete data still needs no caveat, even if the read errored.
+        assert_eq!(sampling_warning(true, ChannelState::Enabled, denied), None);
     }
 
     #[test]
     fn an_unnamed_exited_client_is_still_reported() {
-        let report = attribute(vec![op_from(123, "q", "0x0")], 60, |_| None, |_| false);
+        let report = attribute(read_of(vec![op_from(123, "q", "0x0")]), 60, |_| None, |_| false);
         let client = report.top_client().expect("client");
         assert_eq!(client.pid, 123, "an unnameable pid is still evidence");
         assert_eq!(client.name, None);
@@ -602,6 +831,13 @@ mod tests {
             state,
             ChannelState::Enabled | ChannelState::Disabled | ChannelState::Unknown
         ));
+    }
+
+    fn read_of(operations: Vec<WmiOperation>) -> WmiRead {
+        WmiRead {
+            operations,
+            trace_read_error: None,
+        }
     }
 
     fn op_from(pid: u32, query: &str, code: &str) -> WmiOperation {

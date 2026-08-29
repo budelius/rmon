@@ -259,10 +259,26 @@ It logs every WMI call on the machine while on, so turn it back off once
 you have your answer:
 
 ```powershell
-rmon wmi --trace on     # complete; needs Administrator
-rmon wmi                # read it
-rmon wmi --trace off
+rmon wmi --trace on     # start recording; needs Administrator
+# ...let the load reproduce...
+rmon wmi --trace off    # stop, which is what makes it readable
+rmon wmi                # read what it captured
 ```
+
+Tracing is capture-then-read rather than live, and **both the enable and
+the read need Administrator**. Measured rather than assumed: the analytic
+channel refuses a query by channel path with "the request is not supported"
+whether or not it is recording, so its events are only reachable through
+the backing `Microsoft-Windows-WMI-Activity%4Trace.evtx` under
+`%SystemRoot%\System32\Winevt\Logs` — and that directory is not
+user-readable.
+
+rMon reports which step is missing rather than repeating generic advice: it
+distinguishes "tracing is off" from "tracing is on but nothing traced was
+readable", and when the capture cannot be opened it says so explicitly
+(`the full trace was not read: ... Access is denied`). That matters because
+a result silently narrowed by permissions looks exactly like a complete
+one.
 
 Callers are marked running or exited, because those are different problems:
 one long-lived process polling in a loop is fixed by changing its interval,

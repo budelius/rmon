@@ -20,9 +20,17 @@ that does not depend on remembering what you installed.
 - **The default view is a biased sample, and says so.** Windows only records
   operations slow enough to cross an internal threshold unless full tracing
   is on, and the busiest caller is often a short-lived process that never
-  crosses it. rMon can enable the complete analytic channel for you (needs
-  Administrator) and tells you to turn it back off afterwards. A quiet
-  result with tracing off is not evidence that nothing is hammering WMI.
+  crosses it. A quiet result with tracing off is not evidence that nothing
+  is hammering WMI, so rMon never lets that read as an all-clear.
+- Full tracing is **capture-then-read**, not live, and rMon says which step
+  you are missing rather than repeating generic advice. Measured rather
+  than assumed: the analytic channel refuses a query by channel path
+  whether or not it is recording, its events are only reachable through the
+  backing `.evtx` under `System32\Winevt\Logs`, and opening that needs
+  Administrator. So: enable (Administrator), let the load reproduce,
+  disable, then read (Administrator). When the capture cannot be opened,
+  the reason is carried on the report — a result silently narrowed by
+  permissions otherwise looks identical to a complete one.
 - Callers are marked running or exited: one process polling in a loop and a
   stream of short-lived processes each asking once are different problems
   with different fixes.
