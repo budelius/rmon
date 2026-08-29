@@ -227,6 +227,23 @@ struct HealthArgs {
     max_events: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WmiActivityArgs {
+    /// How far back to look, in seconds (default 3600).
+    #[serde(default)]
+    secs: Option<i64>,
+    /// Cap on operations returned, most recent first (default 5000).
+    #[serde(default)]
+    max_events: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OrphanArgs {
+    /// Only return groups holding at least this many processes (default 2).
+    #[serde(default)]
+    min_size: Option<usize>,
+}
+
 enum SamplerMsg {
     Sample(std_mpsc::Sender<Snapshot>),
 }
@@ -597,5 +614,62 @@ impl RmonMcpServer {
             .await
             .map_err(to_mcp_err)?;
         text_result(&serde_json::to_value(&report).map_err(to_mcp_err)?)
+    }
+
+    #[tool(
+        description = "Attribute WMI activity to the processes that caused it — the tool to reach for when WmiPrvSE.exe is burning CPU, because that host does work other processes asked for and no process list will say who. Reads the Windows WMI-Activity event channels directly via EvtQuery, never through WMI itself (querying WMI to diagnose WMI saturation would add to the load being measured). Each caller is returned with its operation count, whether it is still running, and the queries it issued. IMPORTANT: `trace_channel` says whether full tracing is on. When it is not `Enabled`, Windows only records operations slow enough to cross an internal threshold, `sampling_warning` is set, and the results are a biased sample in which the busiest caller may be absent entirely — a quiet result is then NOT evidence that nothing is hammering WMI. Enabling the complete channel needs Administrator and is done from rMon's `wmi` tab or `rmon wmi --trace on`. Callers that already exited are still listed by pid, with `alive: false`; a caller that keeps exiting and being replaced is a different problem from one long-lived process polling in a loop."
+    )]
+    async fn wmi_activity(
+        &self,
+        Parameters(args): Parameters<WmiActivityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let secs = args.secs.unwrap_or(rmon_core::wmi_activity::DEFAULT_LOOKBACK_SECS);
+        let max_events = args
+            .max_events
+            .unwrap_or(rmon_core::wmi_activity::DEFAULT_MAX_EVENTS);
+        let snap = self.snapshot_now().await;
+        let live: std::collections::HashMap<u32, String> = snap
+            .processes
+            .iter()
+            .map(|p| (p.pid, p.name.clone()))
+            .collect();
+
+        let report = tokio::task::spawn_blocking(move || {
+            rmon_core::wmi_activity::read_operations(secs, max_events).map(|ops| {
+                rmon_core::wmi_activity::attribute(
+                    ops,
+                    secs,
+                    |pid| live.get(&pid).cloned(),
+                    |pid| live.contains_key(&pid),
+                )
+            })
+        })
+        .await
+        .map_err(to_mcp_err)?
+        .map_err(to_mcp_err)?;
+        text_result(&serde_json::to_value(&report).map_err(to_mcp_err)?)
+    }
+
+    #[tool(
+        description = "Clusters of live processes whose parent process no longer exists, grouped by that dead parent — abandoned sessions still holding processes. Being orphaned is not itself a fault: anything started from a shell that has since closed is an orphan, so a single one means nothing. What this surfaces is the shape — dozens of processes all naming the same departed parent is one abandoned launcher, and a large total is worth knowing because everything that enumerates processes (including WMI queries and rMon's own sampling) costs in proportion to how many exist. Groups are ranked largest first with their composition (e.g. 38x bash.exe), combined CPU and memory. The dead parent is named only when ETW exit history saw it exit (needs Administrator, and only covers parents that died while rMon was watching); otherwise only its pid is known, which does not make the group less real. Note Windows reuses pids, so a group means 'these processes recorded that pid as their parent', usually one abandoned launcher."
+    )]
+    async fn orphan_groups(
+        &self,
+        Parameters(args): Parameters<OrphanArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let min_size = args.min_size.unwrap_or(rmon_core::DEFAULT_MIN_GROUP);
+        let snap = self.snapshot_now().await;
+        let exits = self
+            .short_lived
+            .as_ref()
+            .map(|w| w.recent())
+            .unwrap_or_default();
+        let groups = rmon_core::significant_groups(&snap.processes, &exits, min_size);
+        text_result(&serde_json::json!({
+            "total_processes": snap.processes.len(),
+            "groups_held_processes": groups.iter().map(|g| g.len()).sum::<usize>(),
+            "parent_naming_available": !exits.is_empty(),
+            "groups": groups,
+        }))
     }
 }

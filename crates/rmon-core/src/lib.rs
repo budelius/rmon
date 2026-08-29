@@ -11,6 +11,7 @@ pub mod hello;
 mod history;
 mod hwinfo;
 mod model;
+mod orphans;
 pub mod observability;
 pub mod pawnio;
 mod ports;
@@ -23,7 +24,14 @@ mod thermal;
 pub mod throttle;
 mod tree;
 pub mod trends;
+pub mod wmi_activity;
 
+pub use orphans::{
+    DEFAULT_MIN_GROUP, NameCount, OrphanGroup, orphan_groups, significant_groups,
+};
+pub use wmi_activity::{
+    ChannelState, WmiActivityReport, WmiChannel, WmiClient, WmiOperation,
+};
 pub use handles::{
     AllFilesEntry, DEFAULT_SCAN_WORKERS, OpenFilesScan, handle_count, kill_process,
     list_open_files, list_open_files_many,

@@ -21,6 +21,7 @@ use rmon_core::{
     DEFAULT_WHEA_MAX_EVENTS, GpuSource, HardwareHealthReport, InstalledProgram,
     InstalledProgramsScan, OpenFilesScan, PortEntry, ProcessSample, ProgramAttribution,
     ProgramRelationship, RollingHistory, ShortLivedWatcher, Store, SystemMetrics, ThrottleHistory,
+    WmiActivityReport,
     attribute_processes, build_tree, check_hardware_health, list_installed_programs,
     list_open_files, list_open_files_many, listening_ports_for, load_program_usage,
     merge_recent_exits, process_attention_reasons, program_relationships, save_program_usage,
@@ -167,6 +168,7 @@ enum Tab {
     Sensors,
     Health,
     Exited,
+    Wmi,
     Search,
     WhatsNew,
     Settings,
@@ -176,7 +178,7 @@ impl Tab {
     /// Strip order, left to right: the live table first, then the views
     /// that explain why it looks the way it does, then the tools, then
     /// settings.
-    const ALL: [Tab; 10] = [
+    const ALL: [Tab; 11] = [
         Tab::Processes,
         Tab::Programs,
         Tab::Suspects,
@@ -184,6 +186,7 @@ impl Tab {
         Tab::Sensors,
         Tab::Health,
         Tab::Exited,
+        Tab::Wmi,
         Tab::Search,
         Tab::WhatsNew,
         Tab::Settings,
@@ -199,6 +202,7 @@ impl Tab {
             Tab::Analyze => "analyze",
             Tab::Sensors => "sensors",
             Tab::Health => "health",
+            Tab::Wmi => "wmi",
             Tab::Exited => "exited",
             Tab::Search => "search",
             Tab::WhatsNew => "what's new",
@@ -218,6 +222,9 @@ impl Tab {
             Tab::Analyze => "ask an LLM to explain what is making this machine slow",
             Tab::Sensors => "every hardware sensor reading rMon can see",
             Tab::Health => "WHEA hardware error events, BIOS version, CPU microcode revision",
+            Tab::Wmi => {
+                "which processes are driving WMI, when WmiPrvSE.exe is burning CPU nothing else can explain"
+            }
             Tab::Exited => {
                 "processes that started and exited between sampling ticks (needs Administrator)"
             }
@@ -337,6 +344,83 @@ impl SearchState {
 enum HealthStatus {
     Scanning(mpsc::Receiver<HardwareHealthReport>),
     Done(HardwareHealthReport),
+}
+
+/// State for the WMI attribution tab.
+///
+/// Reading the activity channels is event-log I/O, so it goes on a
+/// background thread for the same reason the WHEA query does. Notably it
+/// does *not* go through WMI — see [`rmon_core::wmi_activity`], since
+/// querying WMI to diagnose WMI saturation would add to the load being
+/// measured.
+struct WmiState {
+    status: WmiStatus,
+    /// Result of the last enable/disable attempt, kept so a failure that
+    /// needs Administrator is visible rather than silently ignored.
+    toggle_error: Option<String>,
+    lookback_secs: i64,
+}
+
+enum WmiStatus {
+    Idle,
+    Scanning(mpsc::Receiver<std::result::Result<WmiActivityReport, String>>),
+    Done(Box<WmiActivityReport>),
+    Error(String),
+}
+
+impl WmiState {
+    fn new() -> Self {
+        Self {
+            status: WmiStatus::Idle,
+            toggle_error: None,
+            lookback_secs: rmon_core::wmi_activity::DEFAULT_LOOKBACK_SECS,
+        }
+    }
+
+    /// Reads the channels and attributes each operation to a process.
+    ///
+    /// `live` is the current process table, passed in rather than sampled
+    /// on the worker so the names come from the same snapshot the rest of
+    /// the window is showing.
+    fn start(lookback_secs: i64, live: HashMap<u32, String>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = rmon_core::wmi_activity::read_operations(
+                lookback_secs,
+                rmon_core::wmi_activity::DEFAULT_MAX_EVENTS,
+            )
+            .map(|ops| {
+                rmon_core::wmi_activity::attribute(
+                    ops,
+                    lookback_secs,
+                    |pid| live.get(&pid).cloned(),
+                    |pid| live.contains_key(&pid),
+                )
+            })
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        Self {
+            status: WmiStatus::Scanning(rx),
+            toggle_error: None,
+            lookback_secs,
+        }
+    }
+
+    fn poll(&mut self) {
+        if let WmiStatus::Scanning(rx) = &self.status
+            && let Ok(result) = rx.try_recv()
+        {
+            self.status = match result {
+                Ok(report) => WmiStatus::Done(Box::new(report)),
+                Err(e) => WmiStatus::Error(e),
+            };
+        }
+    }
+
+    fn scanning(&self) -> bool {
+        matches!(self.status, WmiStatus::Scanning(_))
+    }
 }
 
 /// The WHEA query is fast now (`EvtQuery` against the System channel's
@@ -812,6 +896,8 @@ struct RmonApp {
     /// WHEA events / BIOS / microcode revision — `None` until the view is
     /// opened for the first time (or "rescan" is clicked again).
     health: Option<HealthState>,
+    /// WMI caller attribution; lazily populated when the tab is opened.
+    wmi: WmiState,
     /// `None` if not elevated or the ETW trace failed to start (see
     /// `short_lived_error` for why); catches processes that start and
     /// fully exit between polling ticks, which `Sampler` alone can't see.
@@ -887,6 +973,7 @@ impl RmonApp {
             trends: Vec::new(),
             trends_at: None,
             health: None,
+            wmi: WmiState::new(),
             short_lived: match ShortLivedWatcher::start() {
                 Ok(w) => Some(w),
                 Err(e) => {
@@ -1322,6 +1409,7 @@ impl eframe::App for RmonApp {
         if let Some(h) = self.health.as_mut() {
             h.poll();
         }
+        self.wmi.poll();
         if self.programs.poll() {
             let processes = self
                 .history
@@ -1360,6 +1448,7 @@ impl eframe::App for RmonApp {
             || self.analyze.unlocking()
             || self.hwinfo_sensor_rx.is_some()
             || self.health.as_ref().is_some_and(HealthState::scanning)
+            || self.wmi.scanning()
             || self.programs.scanning();
         let repaint_interval = if animating {
             Duration::from_millis(200)
@@ -1527,6 +1616,7 @@ impl eframe::App for RmonApp {
                 Tab::Analyze => self.draw_analyze(ui),
                 Tab::Sensors => self.draw_hardware(ui),
                 Tab::Health => self.draw_health(ui),
+                Tab::Wmi => self.draw_wmi(ui),
                 Tab::Exited => self.draw_recent_exits(ui),
                 Tab::Search => self.draw_search_all(ui),
                 Tab::WhatsNew => about::whats_new_tab(ui),
@@ -3412,6 +3502,81 @@ impl RmonApp {
     /// burners (large accumulated CPU while currently near-idle). All of it
     /// is heuristic over this session's in-memory history — a flagged
     /// process is a suspect worth looking at, not a confirmed leak.
+    /// Clusters of live processes whose parent is gone.
+    ///
+    /// Shown as groups rather than rows on purpose: a single orphan is
+    /// unremarkable — anything started from a shell that has since closed
+    /// is one — but forty naming the same departed parent is one abandoned
+    /// session, and that reads as one line instead of forty.
+    fn draw_orphan_groups(&mut self, ui: &mut egui::Ui) {
+        let Some(snapshot) = self.history.latest() else {
+            return;
+        };
+        let exits = self
+            .short_lived
+            .as_ref()
+            .map(|w| w.recent())
+            .unwrap_or_default();
+        let groups = rmon_core::significant_groups(
+            &snapshot.processes,
+            &exits,
+            rmon_core::DEFAULT_MIN_GROUP,
+        );
+        if groups.is_empty() {
+            return;
+        }
+
+        let held: usize = groups.iter().map(|g| g.len()).sum();
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.heading("Abandoned process groups");
+        ui.weak(format!(
+            "{} group(s) holding {held} of {} live processes, each sharing a parent that no \
+             longer exists. Being orphaned is not itself a fault — this is about the size of \
+             the pile, since everything that enumerates processes pays for it.",
+            groups.len(),
+            snapshot.processes.len(),
+        ));
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("orphan-groups")
+            .max_height(280.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for g in &groups {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{}x", g.len())).strong());
+                        let what = g
+                            .composition
+                            .iter()
+                            .take(3)
+                            .map(|c| format!("{} {}", c.count, c.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.label(what);
+                        match &g.parent_name {
+                            Some(name) => {
+                                ui.weak(format!("← {name} (pid {}, exited)", g.dead_ppid))
+                            }
+                            // Without ETW history the parent died before
+                            // rMon was watching; the bare pid is all that
+                            // is honestly known.
+                            None => ui.weak(format!("← pid {} (gone)", g.dead_ppid)),
+                        };
+                        if g.total_cpu_percent >= 1.0 {
+                            ui.colored_label(
+                                WARN_COLOR,
+                                format!("{:.1}% CPU", g.total_cpu_percent),
+                            );
+                        }
+                        ui.weak(format!("{} MiB", g.total_mem_bytes / (1024 * 1024)));
+                    });
+                }
+            });
+    }
+
     fn draw_suspects(&mut self, ui: &mut egui::Ui) {
         ui.heading("Leak & idle suspects");
         ui.weak(format!(
@@ -3474,6 +3639,8 @@ impl RmonApp {
                     }
                 }
             });
+
+        self.draw_orphan_groups(ui);
     }
 
     /// Substring search for open files and listening ports across *every*
@@ -3760,6 +3927,175 @@ impl RmonApp {
     /// facts to weigh alongside other evidence (new instability under
     /// load), not a degradation diagnosis in themselves. The scan runs on
     /// a background thread (see `HealthState`) since it's slow.
+    /// Names the processes driving WMI.
+    ///
+    /// The headline number people arrive with is `WmiPrvSE.exe` at several
+    /// hundred percent, which is unactionable on its own: the provider host
+    /// is doing work someone *else* asked for, and no task manager will say
+    /// who. This tab answers that.
+    fn draw_wmi(&mut self, ui: &mut egui::Ui) {
+        ui.heading("WMI callers");
+        ui.weak(
+            "WmiPrvSE.exe does the work, but another process asked for it. This attributes \
+             each operation back to the process that made the call.",
+        );
+        ui.add_space(8.0);
+
+        let state = rmon_core::wmi_activity::trace_state();
+        let elevated = rmon_core::elevate::is_elevated();
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("Full tracing:");
+                match state {
+                    rmon_core::ChannelState::Enabled => {
+                        ui.colored_label(OK_COLOR, "on — every operation is recorded");
+                    }
+                    rmon_core::ChannelState::Disabled => {
+                        ui.colored_label(WARN_COLOR, "off — only slow operations are recorded");
+                    }
+                    rmon_core::ChannelState::Unknown => {
+                        ui.colored_label(UNKNOWN_COLOR, "unknown (needs Administrator to read)");
+                    }
+                }
+            });
+            // Worth stating plainly: with tracing off, an empty or boring
+            // result is not evidence that nothing is hammering WMI.
+            ui.weak(
+                "Windows only logs operations slow enough to cross a threshold unless full \
+                 tracing is on, and the busiest caller is often a short-lived process that \
+                 never crosses it. Turn tracing on to catch it, then turn it back off — it \
+                 logs every WMI call on the machine.",
+            );
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                let want_on = state != rmon_core::ChannelState::Enabled;
+                let label = if want_on {
+                    "Turn full tracing on"
+                } else {
+                    "Turn full tracing off"
+                };
+                if ui
+                    .add_enabled(elevated, egui::Button::new(label))
+                    .on_disabled_hover_text("Needs Administrator — restart rMon elevated")
+                    .clicked()
+                {
+                    self.wmi.toggle_error =
+                        match rmon_core::wmi_activity::set_trace_enabled(want_on) {
+                            Ok(()) => None,
+                            Err(e) => Some(format!("{e:#}")),
+                        };
+                }
+                if !elevated {
+                    ui.weak("(needs Administrator)");
+                }
+            });
+            if let Some(err) = &self.wmi.toggle_error {
+                ui.colored_label(BAD_COLOR, err);
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let scanning = self.wmi.scanning();
+            if ui
+                .add_enabled(!scanning, egui::Button::new("🔄 Read WMI activity"))
+                .clicked()
+            {
+                let live: HashMap<u32, String> = self
+                    .history
+                    .latest()
+                    .map(|s| s.processes.iter().map(|p| (p.pid, p.name.clone())).collect())
+                    .unwrap_or_default();
+                self.wmi = WmiState::start(self.wmi.lookback_secs, live);
+            }
+            if scanning {
+                ui.spinner();
+                ui.weak("reading the event channels...");
+            }
+            ui.separator();
+            ui.label("window:");
+            let mut minutes = (self.wmi.lookback_secs / 60).max(1);
+            if ui
+                .add(egui::DragValue::new(&mut minutes).range(1..=1440).suffix(" min"))
+                .changed()
+            {
+                self.wmi.lookback_secs = minutes * 60;
+            }
+        });
+        ui.add_space(8.0);
+
+        match &self.wmi.status {
+            WmiStatus::Idle => {
+                ui.weak("Nothing read yet — press “Read WMI activity”.");
+            }
+            WmiStatus::Scanning(_) => {}
+            WmiStatus::Error(e) => {
+                ui.colored_label(BAD_COLOR, e);
+            }
+            WmiStatus::Done(report) => {
+                ui.label(format!(
+                    "{} operation(s) from {} caller(s) in the last {} min",
+                    report.operations.len(),
+                    report.clients.len(),
+                    report.window_secs / 60,
+                ));
+                if let Some(warning) = &report.sampling_warning {
+                    ui.add_space(4.0);
+                    ui.colored_label(WARN_COLOR, warning);
+                }
+                ui.add_space(8.0);
+
+                if report.clients.is_empty() {
+                    ui.weak("No WMI activity recorded in this window.");
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("wmi-clients")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for client in &report.clients {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{} ops", client.operations))
+                                            .strong(),
+                                    );
+                                    ui.label(format!("pid {}", client.pid));
+                                    ui.label(
+                                        client.name.as_deref().unwrap_or("(exited, unnamed)"),
+                                    );
+                                    if client.alive {
+                                        ui.colored_label(OK_COLOR, "running");
+                                    } else {
+                                        // A caller that keeps exiting and
+                                        // being replaced is a different
+                                        // problem from one polling in a
+                                        // loop, and needs a different fix.
+                                        ui.colored_label(UNKNOWN_COLOR, "exited");
+                                    }
+                                    if client.failed_operations > 0 {
+                                        ui.colored_label(
+                                            WARN_COLOR,
+                                            format!("{} failed", client.failed_operations),
+                                        );
+                                    }
+                                });
+                                for q in client.queries.iter().take(4) {
+                                    ui.horizontal(|ui| {
+                                        ui.weak(format!("{}x", q.count));
+                                        ui.monospace(
+                                            q.query.chars().take(160).collect::<String>(),
+                                        );
+                                    });
+                                }
+                            });
+                        }
+                    });
+            }
+        }
+    }
+
     fn draw_health(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Hardware health");

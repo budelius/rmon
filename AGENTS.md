@@ -58,6 +58,9 @@ cargo run -p rmon-cli -- mcp
 - Tool output must preserve the "measured zero" vs "could not measure" distinction as `null`. A model handed a fabricated zero will rule out causes it has no evidence about.
 - Installed-program inventory is best-effort Win32/MSI Uninstall-registry data, not a complete Store/portable-app inventory. `ParentKeyName` links and observed process parentage must never be presented as a universal package dependency graph. “Last seen” is only rMon's persisted observation timestamp; `never` and session inactivity must never be labeled “unused” or “safe to uninstall.” rMon does not execute uninstall commands.
 - LLM credentials may come from `RMON_LLM_API_KEY`/`OPENAI_API_KEY` or the Settings UI. Saved keys must remain DPAPI/Windows-Hello protected and must never be persisted in plaintext, SQLite, or logs.
+- Never read the WMI-Activity channels through WMI. `wmi_activity.rs` uses `EvtQuery` deliberately: the whole point is diagnosing a saturated provider host, and routing the diagnostic through it would add to the load being measured. The same applies to anything else that measures WMI.
+- Results from the WMI Operational channel are a *sample*, not a census — Windows only logs operations slow enough to cross a threshold, and the heaviest caller is routinely a short-lived process that never crosses it. Any surface showing those counts must carry the caveat and say that full tracing exists; "no activity found" must never read as "nothing is using WMI".
+- Orphan *groups* report shape, not blame. Being orphaned is normal (see `trends.rs`), so never label a group as a fault or imply the processes are safe to kill; and never invent a name for a dead parent that ETW exit history did not see exit.
 - Observability is environment-driven and must remain a no-op when its variables are unset. See `crates/rmon-core/OBSERVABILITY.md`.
 - Do not commit `target/`, SQLite/CSV runtime output, or `hook_outputs/`.
 

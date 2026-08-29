@@ -52,6 +52,14 @@ cargo run -p rmon-cli -- programs
 cargo run -p rmon-cli -- programs --filter warp --active
 cargo run -p rmon-cli -- programs --review
 
+# Who is driving WMI (when WmiPrvSE.exe is burning CPU nothing else explains)
+cargo run -p rmon-cli -- wmi
+cargo run -p rmon-cli -- wmi --trace on     # complete tracing; needs Administrator
+
+# Abandoned process groups: live processes whose parent is gone
+cargo run -p rmon-cli -- orphans
+cargo run -p rmon-cli -- orphans --members
+
 # Hardware health: WHEA event log entries, BIOS version, CPU microcode revision
 cargo run -p rmon-cli -- health --days 7
 
@@ -73,7 +81,7 @@ substring search box and a header line with CPU/GPU temperature and
 throttle status (see below).
 
 The GUI's left column is a tab strip — **processes · programs · suspects ·
-analyze · sensors · health · exited · search · what's new · settings** — so every view is one click from
+analyze · sensors · health · exited · wmi · search · what's new · settings** — so every view is one click from
 every other. (These were previously buried in the App menu, each opening a
 panel with its own "back" button, which meant the only route from one view
 to another ran through the process table.) The suspects tab shows its count
@@ -226,6 +234,71 @@ running elevated. It can't recover lineage from before that — Windows
 doesn't retain process-parentage history by default (Sysmon or Windows'
 own Process Creation auditing, event 4688, are the standard ways to get
 that further back, neither of which rMon uses today).
+
+### Who is driving WMI
+
+`WmiPrvSE.exe` pinning several cores is a symptom whose cause is hidden one
+process away: the provider host does the work, but some *other* process
+asked for it, and no task manager will tell you which. The **wmi** tab
+(`rmon wmi`, or the `wmi_activity` MCP tool) attributes each operation back
+to the caller, with the queries it issued and whether it is still running.
+
+It reads the WMI-Activity event channels through `EvtQuery` and never
+through WMI itself. That is deliberate: the thing being diagnosed is a
+saturated provider host, and asking it to answer questions about its own
+overload would add to the load being measured. (`Win32_NTLogEvent` cannot
+read modern ETW channels anyway.)
+
+**The default view is a sample, not a census.** Windows records only those
+operations slow enough to cross an internal threshold unless full tracing is
+enabled, and the heaviest caller is frequently a short-lived process that
+never crosses it — so an empty result with tracing off is *not* evidence
+that nothing is hammering WMI. rMon says so wherever it shows those counts,
+and can enable the complete analytic channel for you (needs Administrator).
+It logs every WMI call on the machine while on, so turn it back off once
+you have your answer:
+
+```powershell
+rmon wmi --trace on     # complete; needs Administrator
+rmon wmi                # read it
+rmon wmi --trace off
+```
+
+Callers are marked running or exited, because those are different problems:
+one long-lived process polling in a loop is fixed by changing its interval,
+while a stream of short-lived processes each asking once is fixed by finding
+whatever spawns them. Exited callers are still listed by pid — rMon names
+them from ETW exit history when it has it.
+
+### Abandoned process groups
+
+Live processes whose parent no longer exists, grouped by that dead parent
+and ranked largest first — shown in the **suspects** tab, `rmon orphans`,
+and the `orphan_groups` MCP tool.
+
+Being orphaned is not a fault, and rMon does not treat it as one: anything
+started from a shell that has since closed is an orphan. What is worth
+seeing is the *shape*. Forty processes all naming the same departed parent
+is one abandoned session, and it reads as a single line instead of forty
+scattered rows:
+
+```
+38 processes [38x bash.exe] orphaned by pid 143336, 15.5% CPU, 362 MiB
+19 processes [19x powershell.exe] orphaned by pid 126844, 0.0% CPU, 762 MiB
+```
+
+This matters because process count is not free: every WMI enumeration,
+every task manager, and rMon's own sampling all cost in proportion to how
+many processes exist. A machine carrying a few hundred abandoned shells
+makes everything that walks the process table slower, including the tools
+you would reach for to find out why it is slow.
+
+The dead parent is named when ETW exit history saw it exit (needs
+Administrator, and only covers parents that died while rMon was watching);
+otherwise the group carries its bare pid rather than inventing a name.
+Windows reuses pids, so a group means "these processes recorded that pid as
+their parent" — usually one abandoned launcher, occasionally a coincidence
+of reuse.
 
 ### Hardware health (WHEA events, BIOS, microcode)
 

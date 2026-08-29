@@ -7,6 +7,43 @@ that does not depend on remembering what you installed.
 
 ## 0.3.0 — 2026-08-28
 
+### Who is driving WMI
+
+- New **wmi** tab, `rmon wmi`, and a `wmi_activity` MCP tool. When
+  `WmiPrvSE.exe` is burning cores, that host is doing work *another* process
+  asked for, and no process list will say who. This attributes each
+  operation back to the caller, including callers that have already exited.
+- Reads the WMI-Activity event channels directly through `EvtQuery`, never
+  through WMI. Querying WMI to diagnose WMI saturation would add load to the
+  thing being measured — and `Win32_NTLogEvent` cannot read modern ETW
+  channels anyway.
+- **The default view is a biased sample, and says so.** Windows only records
+  operations slow enough to cross an internal threshold unless full tracing
+  is on, and the busiest caller is often a short-lived process that never
+  crosses it. rMon can enable the complete analytic channel for you (needs
+  Administrator) and tells you to turn it back off afterwards. A quiet
+  result with tracing off is not evidence that nothing is hammering WMI.
+- Callers are marked running or exited: one process polling in a loop and a
+  stream of short-lived processes each asking once are different problems
+  with different fixes.
+
+### Abandoned process groups
+
+- New **orphans** section in the suspects tab, `rmon orphans`, and an
+  `orphan_groups` MCP tool: clusters of live processes whose parent no
+  longer exists, grouped by that dead parent and ranked largest first.
+- Being orphaned is not a fault — anything started from a shell that has
+  since closed is an orphan — so this reports *shape*, not blame. Forty
+  processes naming one departed parent is a single abandoned session, and
+  reads as one line instead of forty scattered rows.
+- Worth having because process count is not free: every WMI enumeration,
+  every task manager, and rMon's own sampling all cost in proportion to it.
+  On the machine this was built for it found 29 groups holding 134
+  processes, the largest being 38 `bash.exe` under one long-dead launcher.
+- The dead parent gets a name when ETW exit history saw it go, and its bare
+  pid otherwise. Windows reuses pids, so a group means "these processes
+  recorded that pid as their parent" — usually one abandoned launcher.
+
 ### CPU percentages say which percentage they are
 
 - Per-process `cpu_percent` is percent of **one core**, so a single-threaded

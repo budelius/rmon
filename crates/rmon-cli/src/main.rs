@@ -109,6 +109,44 @@ enum Command {
         #[arg(long, default_value_t = rmon_core::DEFAULT_WHEA_MAX_EVENTS)]
         max_events: usize,
     },
+    /// Name the processes driving WMI, when `WmiPrvSE.exe` is burning CPU
+    /// that Task Manager cannot attribute to anyone.
+    ///
+    /// Reads the WMI-Activity event channels natively — never through WMI
+    /// itself, which would add load to the thing being measured. The
+    /// always-on Operational channel only records operations slow enough to
+    /// cross a threshold, so the busiest caller can be missing from it
+    /// entirely; `--trace on` enables the analytic channel that records
+    /// every operation, which is what actually names the caller.
+    Wmi {
+        /// How far back to look, in seconds.
+        #[arg(long, default_value_t = rmon_core::wmi_activity::DEFAULT_LOOKBACK_SECS)]
+        secs: i64,
+        /// Cap on events read.
+        #[arg(long, default_value_t = rmon_core::wmi_activity::DEFAULT_MAX_EVENTS)]
+        max_events: usize,
+        /// How many callers to list.
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        /// Turn the complete-but-noisy analytic trace channel on or off.
+        /// Needs Administrator. Turn it back off when finished.
+        #[arg(long, value_name = "on|off")]
+        trace: Option<String>,
+    },
+    /// Find clusters of live processes whose parent is gone — abandoned
+    /// sessions still holding processes.
+    ///
+    /// One orphan is unremarkable; anything started from a shell that has
+    /// since closed is one. Dozens sharing a single dead parent is one
+    /// abandoned launcher, and that is what this surfaces.
+    Orphans {
+        /// Only show groups holding at least this many processes.
+        #[arg(long, default_value_t = rmon_core::DEFAULT_MIN_GROUP)]
+        min_size: usize,
+        /// Also list every process in each group, not just the summary.
+        #[arg(long)]
+        members: bool,
+    },
     /// Report what rMon can read directly from the hardware: CPU thermal
     /// MSRs plus motherboard temperatures, voltages, and fan tachometers,
     /// via the PawnIO driver.
@@ -154,6 +192,13 @@ fn main() -> Result<()> {
         } => run_programs(filter, active, review),
         Command::Mcp => mcp::run(),
         Command::Health { days, max_events } => run_health(days, max_events),
+        Command::Wmi {
+            secs,
+            max_events,
+            top,
+            trace,
+        } => run_wmi(secs, max_events, top, trace),
+        Command::Orphans { min_size, members } => run_orphans(min_size, members),
         Command::Sensors { raw } => run_sensors(raw),
     };
     if let Err(err) = &result {
@@ -840,5 +885,133 @@ fn run_record(
     }
 
     println!("stopped after {ticks} samples");
+    Ok(())
+}
+
+/// Names the processes driving WMI. See the `Wmi` command docs for why the
+/// two channels give very different answers.
+fn run_wmi(secs: i64, max_events: usize, top: usize, trace: Option<String>) -> Result<()> {
+    use rmon_core::wmi_activity::{self, ChannelState};
+
+    if let Some(want) = trace {
+        let enable = match want.to_ascii_lowercase().as_str() {
+            "on" | "true" | "enable" | "enabled" => true,
+            "off" | "false" | "disable" | "disabled" => false,
+            other => anyhow::bail!("--trace expects on or off, got {other:?}"),
+        };
+        wmi_activity::set_trace_enabled(enable)?;
+        println!(
+            "{} {}",
+            wmi_activity::TRACE_CHANNEL,
+            if enable { "enabled" } else { "disabled" }
+        );
+        if enable {
+            println!(
+                "Every WMI operation on this machine is now logged. Re-run `rmon wmi` in a \
+                 minute to see who is calling, then turn it back off with `--trace off`."
+            );
+        }
+        return Ok(());
+    }
+
+    let operations = wmi_activity::read_operations(secs, max_events)?;
+    let snapshot = Sampler::new().sample();
+    let live: std::collections::HashMap<u32, String> = snapshot
+        .processes
+        .iter()
+        .map(|p| (p.pid, p.name.clone()))
+        .collect();
+
+    let report = wmi_activity::attribute(
+        operations,
+        secs,
+        |pid| live.get(&pid).cloned(),
+        |pid| live.contains_key(&pid),
+    );
+
+    println!(
+        "trace channel: {}",
+        match report.trace_channel {
+            ChannelState::Enabled => "enabled (complete)",
+            ChannelState::Disabled => "disabled — only slow operations are recorded",
+            ChannelState::Unknown => "unknown (needs Administrator to read the config)",
+        }
+    );
+    println!(
+        "{} operation(s) from {} caller(s) in the last {}s\n",
+        report.operations.len(),
+        report.clients.len(),
+        report.window_secs,
+    );
+
+    if report.clients.is_empty() {
+        println!("No WMI activity recorded in the window.");
+    }
+    for client in report.clients.iter().take(top) {
+        println!(
+            "{:>6} ops  pid {:<8} {:<24} {}",
+            client.operations,
+            client.pid,
+            client.name.as_deref().unwrap_or("(exited, unnamed)"),
+            if client.alive { "running" } else { "exited" },
+        );
+        if client.failed_operations > 0 {
+            println!("            {} failed", client.failed_operations);
+        }
+        for q in client.queries.iter().take(3) {
+            let text: String = q.query.chars().take(140).collect();
+            println!("            {:>4}x {text}", q.count);
+        }
+    }
+
+    if let Some(warning) = &report.sampling_warning {
+        println!("\n{warning}");
+    }
+    Ok(())
+}
+
+/// Groups orphaned processes under the dead parent that launched them.
+fn run_orphans(min_size: usize, members: bool) -> Result<()> {
+    let snapshot = Sampler::new().sample();
+
+    // ETW exit history can name the dead parent, but only when elevated and
+    // only for parents that died while rMon was watching. Its absence
+    // changes the label, never whether the group is found.
+    let exits = match rmon_core::ShortLivedWatcher::start() {
+        Ok(w) => {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            w.recent()
+        }
+        Err(e) => {
+            eprintln!("(dead parents cannot be named: {e})");
+            Vec::new()
+        }
+    };
+
+    let groups = rmon_core::significant_groups(&snapshot.processes, &exits, min_size);
+    let held: usize = groups.iter().map(|g| g.len()).sum();
+    println!(
+        "{} orphan group(s) holding {held} of {} processes\n",
+        groups.len(),
+        snapshot.processes.len(),
+    );
+
+    for g in &groups {
+        println!("{}", g.summary());
+        if members {
+            for m in &g.members {
+                println!(
+                    "    pid {:<8} {:<28} {:>6.1}% CPU  {:>8} MiB",
+                    m.pid,
+                    m.name,
+                    m.cpu_percent,
+                    m.mem_bytes.unwrap_or(0) / (1024 * 1024),
+                );
+            }
+        }
+    }
+    if groups.is_empty() {
+        println!("(nothing above the --min-size threshold)");
+    }
     Ok(())
 }
