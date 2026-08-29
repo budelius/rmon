@@ -4,3 +4,12 @@
 *.sqlite-shm
 *.csv
 hook_outputs/
+
+# Terraform state and any tfvars holding the runner token
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/*.tfstate
+infra/*.tfstate.*
+infra/*.tfvars
+infra/*.auto.tfvars
+infra/tfplan

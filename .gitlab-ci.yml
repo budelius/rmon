@@ -1,28 +1,35 @@
-# rMon is Windows-only (rmon-core links against native Win32/WMI/NVML
-# APIs), so everything runs on GitLab.com's SaaS Windows runners rather
-# than cross-compiling from Linux -- that also lets `cargo test` actually
-# execute the real Windows-API-touching tests, not just compile them.
+# rMon is Windows-only (rmon-core links against native Win32/WMI/NVML APIs
+# with no cfg(target_os) gates), so there is no Linux runner to fall back
+# to -- and running on Windows is also what lets `cargo test` actually
+# execute the real Windows-API-touching tests rather than just compile them.
+#
+# These jobs run on our own EC2 Windows runner (see infra/), not GitLab's
+# SaaS runners, which ran out of free compute minutes. The runner is stopped
+# by default and bills by the hour, so bring it up around a push:
+#
+#   .\scripts\ci-runner.ps1 start
+#
+# A pipeline queued while it is stopped stays `pending` rather than failing,
+# and the runner stops itself once the build tools go quiet.
 
 stages:
   - build
   - package
 
 .windows_rust:
+  # Must match the tag on the project runner created for infra/.
   tags:
-    - saas-windows-medium-amd64
-  # GitLab's default is 1h, which the installer job overran while still
-  # compiling: it builds cargo-wix from source and then does two release
-  # builds -- and `[profile.release] lto = true` means a fat LTO link over
-  # wgpu/eframe -- with no dependency cache, on a shared Windows runner.
-  # The build job lands around 45 minutes for the same reason, so raise it
-  # for both rather than waiting for that one to start failing too.
-  timeout: 3h
+    - rmon-windows
+  # Was 3h on the SaaS runners, where every pipeline recompiled every
+  # dependency from scratch. This runner keeps the cargo registry and
+  # target/ between jobs, so a warm build is minutes -- but the first
+  # pipeline after provisioning is still cold, hence the headroom.
+  timeout: 1h
   before_script:
-    # Rust isn't preinstalled on the Windows SaaS runner image; bootstrap it
-    # the same way a real dev machine would.
-    - Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
-    - .\rustup-init.exe -y --default-toolchain stable-x86_64-pc-windows-msvc --no-modify-path
-    - $env:Path += ";$env:USERPROFILE\.cargo\bin"
+    # Rust, WiX and the MSVC toolchain are baked into the instance by
+    # infra/bootstrap.ps1 rather than installed per job. Print the versions
+    # so a half-provisioned runner fails here with something readable
+    # instead of a confusing "link.exe not found" mid-build.
     - rustc --version
     - cargo --version
 
@@ -44,14 +51,10 @@ installer:
   extends: .windows_rust
   stage: package
   script:
-    - choco install -y wixtoolset --no-progress
-    - Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
-    - refreshenv
-    # `refreshenv` re-reads PATH from the registry, which wipes out the
-    # cargo bin entry `before_script` added (rustup was installed with
-    # --no-modify-path, so it was never persisted there) -- re-add it.
-    - $env:Path += ";$env:USERPROFILE\.cargo\bin"
-    - cargo install cargo-wix --locked
+    # WiX and cargo-wix are preinstalled on the runner (infra/bootstrap.ps1).
+    # Installing them per job was a large slice of this job's old two-hour
+    # runtime -- cargo-wix was compiled from source every single time.
+    - cargo wix --version
     # cargo-wix builds the GUI package, but the installer also contains the
     # CLI used for snapshot/ports/search/MCP, so build that release binary first.
     - cargo build --release -p rmon-cli
