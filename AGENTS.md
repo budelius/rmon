@@ -64,6 +64,14 @@ cargo run -p rmon-cli -- mcp
 - Observability is environment-driven and must remain a no-op when its variables are unset. See `crates/rmon-core/OBSERVABILITY.md`.
 - Do not commit `target/`, SQLite/CSV runtime output, or `hook_outputs/`.
 
+## Branches, commits, and handoff
+
+- Unless explicitly told otherwise, finish each change task by committing and pushing the work to `origin` so it can be continued on another machine; do not wait for a separate request to commit or push.
+- Create a descriptive non-default branch, or continue the existing task branch. Never commit or push task changes directly to `master`/`main`, force-push, or merge automatically.
+- Run the checks appropriate to the change and review the staged diff before committing. Stage only intended source/documentation changes, never credentials, build artifacts, or runtime output.
+- Preserve unrelated pre-existing edits rather than discarding them or silently mixing them into the task commit. When checkpointing the whole workspace for handoff, put that work in separate, clearly labeled commits.
+- Push with upstream tracking and verify the push succeeded. Report the branch and latest commit, plus any remaining uncommitted work or validation/push blockers; never describe local-only work as available remotely.
+
 ## Packaging
 
 The GitLab `installer` job builds `target/release/rmon.exe` before invoking cargo-wix because the MSI contains both `rmon-gui.exe` and `rmon.exe`. If either binary or its path changes, update `.gitlab-ci.yml`, `crates/rmon-gui/wix/main.wxs`, and the download section in `README.md` together.
