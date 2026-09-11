@@ -623,7 +623,9 @@ impl RmonMcpServer {
         &self,
         Parameters(args): Parameters<WmiActivityArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let secs = args.secs.unwrap_or(rmon_core::wmi_activity::DEFAULT_LOOKBACK_SECS);
+        let secs = args
+            .secs
+            .unwrap_or(rmon_core::wmi_activity::DEFAULT_LOOKBACK_SECS);
         let max_events = args
             .max_events
             .unwrap_or(rmon_core::wmi_activity::DEFAULT_MAX_EVENTS);

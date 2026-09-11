@@ -89,10 +89,7 @@ impl OrphanGroup {
 /// grouping itself needs nothing but the snapshot.
 pub fn orphan_groups(processes: &[ProcessSample], exits: &[RecentExit]) -> Vec<OrphanGroup> {
     let live: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
-    let names: HashMap<u32, &str> = exits
-        .iter()
-        .map(|e| (e.pid, e.name.as_str()))
-        .collect();
+    let names: HashMap<u32, &str> = exits.iter().map(|e| (e.pid, e.name.as_str())).collect();
 
     let mut by_parent: HashMap<u32, Vec<&ProcessSample>> = HashMap::new();
     for p in processes {
@@ -115,7 +112,10 @@ pub fn orphan_groups(processes: &[ProcessSample], exits: &[RecentExit]) -> Vec<O
             }
             let mut composition: Vec<NameCount> = counts
                 .into_iter()
-                .map(|(name, count)| NameCount { name: name.to_string(), count })
+                .map(|(name, count)| NameCount {
+                    name: name.to_string(),
+                    count,
+                })
                 .collect();
             composition.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
 
@@ -212,7 +212,10 @@ mod tests {
         assert_eq!(bash.len(), 38, "largest group must sort first");
         assert_eq!(
             bash.composition,
-            vec![NameCount { name: "bash.exe".into(), count: 38 }]
+            vec![NameCount {
+                name: "bash.exe".into(),
+                count: 38
+            }]
         );
         assert_eq!(bash.total_mem_bytes, 38 * 10 * 1024 * 1024);
         assert!((bash.total_cpu_percent - 19.0).abs() < 0.01);

@@ -14,11 +14,16 @@
 //! explicitly requests HWiNFO's supplemental sensor tree.
 
 pub mod intel_msr;
+pub mod intel_power;
 pub mod superio;
 
 use std::time::{Duration, Instant};
 
 pub use intel_msr::{IntelMsr, PackageThermal};
+pub use intel_power::{
+    CStateConfig, CurrentLimit, LimitReason, PackagePowerLimits, PlatformInfo, PowerControl,
+    PowerLimit, Probe as MsrProbe, RaplUnits, Register as MsrRegister,
+};
 pub use superio::{
     BoardTemperatureReading, Chip, Family, FanReading, RawDump, SlotProbe, SuperIo,
     SuperIoReadings, VoltageReading, probe_slots,

@@ -61,11 +61,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
 use windows::Win32::System::EventLog::{
-    EVT_HANDLE, EVT_VARIANT, EvtChannelConfigEnabled, EvtClose, EvtGetChannelConfigProperty,
-    EvtChannelLoggingConfigLogFilePath, EvtNext, EvtOpenChannelConfig, EvtQuery,
-    EvtQueryChannelPath, EvtQueryFilePath, EvtQueryReverseDirection,
-    EvtRender, EvtRenderEventXml, EvtSaveChannelConfig, EvtSetChannelConfigProperty,
-    EvtVarTypeBoolean,
+    EVT_HANDLE, EVT_VARIANT, EvtChannelConfigEnabled, EvtChannelLoggingConfigLogFilePath, EvtClose,
+    EvtGetChannelConfigProperty, EvtNext, EvtOpenChannelConfig, EvtQuery, EvtQueryChannelPath,
+    EvtQueryFilePath, EvtQueryReverseDirection, EvtRender, EvtRenderEventXml, EvtSaveChannelConfig,
+    EvtSetChannelConfigProperty, EvtVarTypeBoolean,
 };
 use windows::core::PCWSTR;
 
@@ -248,7 +247,10 @@ pub fn attribute(
             }
             let mut queries: Vec<QueryCount> = counts
                 .into_iter()
-                .map(|(query, count)| QueryCount { query: query.to_string(), count })
+                .map(|(query, count)| QueryCount {
+                    query: query.to_string(),
+                    count,
+                })
                 .collect();
             queries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.query.cmp(&b.query)));
 
@@ -265,7 +267,11 @@ pub fn attribute(
             }
         })
         .collect();
-    clients.sort_by(|a, b| b.operations.cmp(&a.operations).then_with(|| a.pid.cmp(&b.pid)));
+    clients.sort_by(|a, b| {
+        b.operations
+            .cmp(&a.operations)
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
 
     let sampling_warning = sampling_warning(saw_trace, trace_channel, trace_read_error.as_deref());
 
@@ -536,7 +542,15 @@ unsafe fn render(event: EVT_HANDLE) -> Option<String> {
     // First call sizes the buffer; it is expected to fail with
     // ERROR_INSUFFICIENT_BUFFER, so the error is deliberately ignored.
     unsafe {
-        let _ = EvtRender(None, event, EvtRenderEventXml.0, 0, None, &mut used, &mut props);
+        let _ = EvtRender(
+            None,
+            event,
+            EvtRenderEventXml.0,
+            0,
+            None,
+            &mut used,
+            &mut props,
+        );
         if used == 0 {
             return None;
         }
@@ -706,7 +720,12 @@ mod tests {
         }
         ops.push(op_from(9, "SELECT * FROM Win32_BIOS", "0x80041010"));
 
-        let report = attribute(read_of(ops), 60, |pid| Some(format!("proc{pid}")), |pid| pid == 7);
+        let report = attribute(
+            read_of(ops),
+            60,
+            |pid| Some(format!("proc{pid}")),
+            |pid| pid == 7,
+        );
 
         let top = report.top_client().expect("a top client");
         assert_eq!(top.pid, 7, "the busiest caller must rank first");
@@ -725,7 +744,12 @@ mod tests {
     /// enough to get logged".
     #[test]
     fn warns_when_only_the_sampled_channel_was_available() {
-        let report = attribute(read_of(vec![op_from(1, "q", "0x0")]), 60, |_| None, |_| false);
+        let report = attribute(
+            read_of(vec![op_from(1, "q", "0x0")]),
+            60,
+            |_| None,
+            |_| false,
+        );
         assert!(
             report.sampling_warning.is_some(),
             "operational-only results must carry the caveat"
@@ -742,8 +766,8 @@ mod tests {
     /// on the thing they already turned on.
     #[test]
     fn the_warning_never_says_to_enable_what_is_already_enabled() {
-        let warning = sampling_warning(false, ChannelState::Enabled, None)
-            .expect("recording but unreadable");
+        let warning =
+            sampling_warning(false, ChannelState::Enabled, None).expect("recording but unreadable");
         assert!(
             !warning.contains("Enable "),
             "must not ask for an already-enabled channel: {warning}"
@@ -801,7 +825,12 @@ mod tests {
 
     #[test]
     fn an_unnamed_exited_client_is_still_reported() {
-        let report = attribute(read_of(vec![op_from(123, "q", "0x0")]), 60, |_| None, |_| false);
+        let report = attribute(
+            read_of(vec![op_from(123, "q", "0x0")]),
+            60,
+            |_| None,
+            |_| false,
+        );
         let client = report.top_client().expect("client");
         assert_eq!(client.pid, 123, "an unnameable pid is still evidence");
         assert_eq!(client.name, None);

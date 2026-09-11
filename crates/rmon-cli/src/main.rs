@@ -162,6 +162,26 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Read the CPU's power-limit configuration and say which limit, if
+    /// any, is currently holding clocks down.
+    ///
+    /// `sensors` can only report that *a* power limit is engaged, because
+    /// that is all the thermal status register says. This asks the RAPL
+    /// and perf-limit-reason registers instead, which separate PL1 from
+    /// PL2 from the EDP/IccMax current ceiling, and report what the BIOS
+    /// actually configured each one to.
+    ///
+    /// Requires Administrator and the PawnIO driver. Registers outside
+    /// the driver module's allowlist are reported as refused rather than
+    /// guessed at.
+    Power {
+        /// Print every candidate register with its raw value and whether
+        /// the driver permitted the read. Use when a decoded field is
+        /// missing and you need to know if the register was denied or
+        /// simply empty.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -200,6 +220,7 @@ fn main() -> Result<()> {
         } => run_wmi(secs, max_events, top, trace),
         Command::Orphans { min_size, members } => run_orphans(min_size, members),
         Command::Sensors { raw } => run_sensors(raw),
+        Command::Power { raw } => run_power(raw),
     };
     if let Err(err) = &result {
         rmon_core::observability::capture_anyhow(err);
@@ -616,6 +637,173 @@ fn print_raw_diagnostics(hub: &rmon_core::SensorHub) {
 
 fn yes_no(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
+}
+
+fn run_power(raw: bool) -> Result<()> {
+    use rmon_core::pawnio::{Module, PawnIo};
+    use rmon_core::sensors::intel_power;
+
+    if !rmon_core::elevate::is_elevated() {
+        println!("rMon is not running as Administrator — the kernel driver cannot be opened.");
+        println!("Re-run this command from an elevated terminal.");
+        return Ok(());
+    }
+
+    let io = match PawnIo::load(Module::IntelMsr) {
+        Ok(io) => io,
+        Err(a) => {
+            println!("Intel MSR access unavailable: {}", a.message());
+            return Ok(());
+        }
+    };
+
+    let probes = intel_power::probe(&io);
+    let find = |addr: u64| {
+        probes
+            .iter()
+            .find(|p| p.register.addr == addr)
+            .and_then(|p| p.raw())
+    };
+
+    // Refusals are the expected outcome for anything the vendored module
+    // does not allowlist, so they are reported as a count rather than as
+    // errors, and only enumerated under --raw.
+    let denied = probes.iter().filter(|p| p.value.is_err()).count();
+    println!(
+        "Read {} of {} power registers ({} refused by the driver module).",
+        probes.len() - denied,
+        probes.len(),
+        denied
+    );
+    println!();
+
+    // Everything below is gated on its own source register: a decoded
+    // line appears only when the register behind it was actually read.
+    let units = find(0x606).map(intel_power::RaplUnits::decode);
+
+    match (find(0x610), units) {
+        (Some(raw), Some(units)) => {
+            let limits = intel_power::PackagePowerLimits::decode(raw, units);
+            println!("Package power limits");
+            for (label, l) in [("PL1", limits.pl1), ("PL2", limits.pl2)] {
+                println!(
+                    "  {label}: {:6.1} W over {:6.3} s   enabled={} clamping={}",
+                    l.watts,
+                    l.window_s,
+                    yes_no(l.enabled),
+                    yes_no(l.clamping)
+                );
+            }
+            println!("  register locked by firmware: {}", yes_no(limits.locked));
+        }
+        (Some(_), None) => {
+            println!("Package power limits: read, but MSR_RAPL_POWER_UNIT was refused")
+        }
+        _ => println!("Package power limits: unavailable"),
+    }
+    println!();
+
+    match find(0x601) {
+        Some(raw) => {
+            let c = intel_power::CurrentLimit::decode(raw);
+            println!(
+                "IccMax (the EDP ceiling): {:.1} A   locked={}",
+                c.amps,
+                yes_no(c.locked)
+            );
+        }
+        None => println!("IccMax: unavailable"),
+    }
+    println!();
+
+    match find(0x64F) {
+        Some(raw) => {
+            let reasons = intel_power::decode_limit_reasons(raw);
+            println!("Why the cores are being held back");
+            let active: Vec<_> = reasons.iter().filter(|r| r.active).collect();
+            if active.is_empty() {
+                println!("  nothing is limiting the cores right now");
+            }
+            for r in active {
+                println!("  ACTIVE NOW: {}", r.name);
+            }
+            let logged: Vec<_> = reasons
+                .iter()
+                .filter(|r| r.since_cleared && !r.active)
+                .collect();
+            for r in logged {
+                println!("  since boot: {}", r.name);
+            }
+        }
+        // This is the register the whole command exists for, so its
+        // absence is worth naming rather than silently skipping.
+        None => println!(
+            "Limit attribution: MSR_CORE_PERF_LIMIT_REASONS was refused — \
+             the driver module does not allowlist it, so PL1/PL2/EDP \
+             cannot be separated on this machine."
+        ),
+    }
+    println!();
+
+    match find(0xE2) {
+        Some(raw) => {
+            let c = intel_power::CStateConfig::decode(raw);
+            println!("Package C-state limit: {}", c.package_limit);
+            println!("  locked by firmware:  {}", yes_no(c.locked));
+            println!("  C1 auto-demotion:    {}", yes_no(c.c1_auto_demotion));
+        }
+        None => println!("Package C-state limit: unavailable"),
+    }
+    if let Some(raw) = find(0x1FC) {
+        let p = intel_power::PowerControl::decode(raw);
+        println!("  C1E enabled:         {}", yes_no(p.c1e_enabled));
+    }
+    println!();
+
+    if let Some(raw) = find(0xCE) {
+        let info = intel_power::PlatformInfo::decode(raw);
+        println!(
+            "Base ratio {}x, minimum ratio {}x, turbo ratios unlocked: {}",
+            info.base_ratio,
+            info.max_efficiency_ratio,
+            yes_no(info.programmable_ratio)
+        );
+    }
+    if let Some(r) = find(0x1AD) {
+        let ratios = intel_power::decode_turbo_ratios(r);
+        let shown: Vec<String> = ratios
+            .iter()
+            .take_while(|&&r| r != 0)
+            .enumerate()
+            .map(|(i, r)| format!("{}c:{}x", i + 1, r))
+            .collect();
+        if !shown.is_empty() {
+            println!("Turbo bins: {}", shown.join("  "));
+        }
+    }
+    if let Some(v) = find(0x198).and_then(intel_power::decode_core_voltage) {
+        println!("Core voltage: {v:.4} V");
+    }
+
+    if raw {
+        println!();
+        println!("Raw register reads");
+        for p in &probes {
+            match &p.value {
+                Ok(v) => println!(
+                    "  {:#06x} {:<30} {v:#018x}",
+                    p.register.addr, p.register.name
+                ),
+                Err(e) => println!(
+                    "  {:#06x} {:<30} REFUSED: {e}",
+                    p.register.addr, p.register.name
+                ),
+            }
+            println!("         {}", p.register.purpose);
+        }
+    }
+
+    Ok(())
 }
 
 fn run_health(days: i64, max_events: usize) -> Result<()> {
