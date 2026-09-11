@@ -4,6 +4,7 @@ mod about;
 mod autostart;
 mod credentials;
 mod icon;
+mod process_table;
 mod sampling;
 mod tray;
 
@@ -15,16 +16,17 @@ use chrono::{DateTime, Utc};
 use credentials::CredentialsEditor;
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
+use process_table::{ProcessSort, SortColumn, SortMetric, SortWindow};
 use rmon_agent::{AgentConfig, AgentEvent, PendingAction, ThrottleSummary, ToolContext};
 use rmon_core::{
     AllFilesEntry, DEFAULT_GHOST_MAX_DEPTH, DEFAULT_SCAN_WORKERS, DEFAULT_WHEA_LOOKBACK_DAYS,
     DEFAULT_WHEA_MAX_EVENTS, GpuSource, HardwareHealthReport, InstalledProgram,
     InstalledProgramsScan, OpenFilesScan, PortEntry, ProcessSample, ProgramAttribution,
     ProgramRelationship, RollingHistory, ShortLivedWatcher, Store, SystemMetrics, ThrottleHistory,
-    WmiActivityReport,
-    attribute_processes, build_tree, check_hardware_health, list_installed_programs,
-    list_open_files, list_open_files_many, listening_ports_for, load_program_usage,
-    merge_recent_exits, process_attention_reasons, program_relationships, save_program_usage,
+    WmiActivityReport, attribute_processes, build_tree, check_hardware_health,
+    list_installed_programs, list_open_files, list_open_files_many, listening_ports_for,
+    load_program_usage, merge_recent_exits, process_attention_reasons, program_relationships,
+    save_program_usage,
 };
 use sampling::{BackgroundSampler, IntervalChoice, Tick};
 use tray::{Tray, TrayAction};
@@ -50,53 +52,6 @@ const TRENDS_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRAM_ACTIVITY_INTERVAL: Duration = Duration::from_secs(3);
 const PROGRAM_USAGE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const PROGRAM_RECENT_USE_DAYS: i64 = 30;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortMetric {
-    Cpu,
-    Gpu,
-    Total,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortWindow {
-    Instant,
-    Accumulated,
-}
-
-/// Which table column currently drives row order. `Metric` defers to
-/// `sort_metric`/`sort_window` (the toolbar controls); the rest sort
-/// directly on that column's own value.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortColumn {
-    Metric,
-    Pid,
-    Name,
-    Src,
-}
-
-fn score(
-    history: &RollingHistory,
-    metric: SortMetric,
-    window: SortWindow,
-    p: &ProcessSample,
-) -> f32 {
-    match window {
-        SortWindow::Instant => match metric {
-            SortMetric::Cpu => p.cpu_percent,
-            SortMetric::Gpu => p.gpu_percent,
-            SortMetric::Total => p.cpu_percent + p.gpu_percent,
-        },
-        SortWindow::Accumulated => {
-            let (cpu_s, gpu_s) = history.accumulated(p.pid);
-            match metric {
-                SortMetric::Cpu => cpu_s as f32,
-                SortMetric::Gpu => gpu_s as f32,
-                SortMetric::Total => (cpu_s + gpu_s) as f32,
-            }
-        }
-    }
-}
 
 /// Formats a duration compactly, e.g. "3h12m", "45m", "38s".
 fn format_duration(d: Duration) -> String {
@@ -854,6 +809,9 @@ struct RmonApp {
     /// recomputed each `resort()`; drives whether a row gets a
     /// collapse/expand arrow.
     tree_has_children: HashSet<u32>,
+    /// Live direct children, computed once per tick from the full snapshot.
+    /// Independent of filters, collapsed rows, and synthetic exited parents.
+    child_counts: HashMap<u32, u32>,
     selected_pid: Option<u32>,
     scroll_to_selected: bool,
     /// False while the window is hidden to the tray or minimized, which is
@@ -952,6 +910,7 @@ impl RmonApp {
             rows: Vec::new(),
             collapsed: HashSet::new(),
             tree_has_children: HashSet::new(),
+            child_counts: HashMap::new(),
             selected_pid: None,
             scroll_to_selected: false,
             window_visible: true,
@@ -1003,6 +962,7 @@ impl RmonApp {
         let Tick {
             snapshot, ports, ..
         } = tick;
+        self.child_counts = snapshot.child_counts();
         self.system = snapshot.system.clone();
         self.throttle.push(&snapshot.system);
         self.ports = ports;
@@ -1070,30 +1030,21 @@ impl RmonApp {
             .cloned()
             .collect();
 
-        let history = &self.history;
-        let metric = self.sort_metric;
-        let window = self.sort_window;
-        let column = self.sort_column;
-        let ascending = self.sort_ascending;
+        let sort = ProcessSort {
+            history: &self.history,
+            metric: self.sort_metric,
+            window: self.sort_window,
+            column: self.sort_column,
+            ascending: self.sort_ascending,
+            child_counts: &self.child_counts,
+        };
 
         self.rows = match self.view_mode {
             ViewMode::Flat => {
                 self.tree_has_children.clear();
                 self.tree_ghosts.clear();
                 let mut v = filtered;
-                v.sort_by(|a, b| {
-                    let ord = match column {
-                        SortColumn::Metric => score(history, metric, window, a)
-                            .partial_cmp(&score(history, metric, window, b))
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                        SortColumn::Pid => a.pid.cmp(&b.pid),
-                        SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                        SortColumn::Src => {
-                            gpu_source_label(a.gpu_source).cmp(gpu_source_label(b.gpu_source))
-                        }
-                    };
-                    if ascending { ord } else { ord.reverse() }
-                });
+                v.sort_by(|a, b| sort.compare(a, b));
                 v.into_iter().map(|p| (0, p)).collect()
             }
             ViewMode::Tree => {
@@ -1111,10 +1062,7 @@ impl RmonApp {
                     merge_recent_exits(&filtered, &recent_exits, DEFAULT_GHOST_MAX_DEPTH);
                 self.tree_ghosts = ghosts;
 
-                // build_tree always ranks descending by key; negate to flip to ascending.
-                let sign = if ascending { -1.0 } else { 1.0 };
-                let key = |p: &ProcessSample| sign * score(history, metric, window, p);
-                let full = build_tree(&augmented, key, self.subtree_sort);
+                let full = sort.tree(&augmented, self.subtree_sort);
 
                 self.tree_has_children.clear();
                 for w in full.windows(2) {
@@ -1278,7 +1226,8 @@ impl RmonApp {
              CPU: {:.1}% instant, {} accumulated (over {})\n\
              GPU: {:.1}% instant, {} accumulated  [source: {}]\n\
              Open handles: {}\n\
-             Memory: {}\n",
+             Memory (working set): {}\n\
+             Live direct children: {}\n",
             p.name,
             p.pid,
             p.ppid
@@ -1304,7 +1253,23 @@ impl RmonApp {
             p.mem_bytes
                 .map(format_bytes)
                 .unwrap_or_else(|| "unknown".to_string()),
+            self.child_counts
+                .get(&pid)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
         );
+        if let Some(fs) = self.files.as_ref().filter(|fs| fs.pid == pid) {
+            match &fs.status {
+                FilesStatus::Done(scan) => text.push_str(&format!(
+                    "Open files (last scan, best-effort): {} unique paths resolved, {} File handles identified, {} name queries timed out\n",
+                    scan.paths.len(), scan.file_handles, scan.timed_out,
+                )),
+                FilesStatus::Scanning(_) => text.push_str("Open files: scanning (unknown)\n"),
+                FilesStatus::Error(_) => text.push_str("Open files: scan failed (unknown)\n"),
+            }
+        } else {
+            text.push_str("Open files: not scanned (unknown)\n");
+        }
         if let Some(verdict) = self.trend_for(pid).and_then(|t| t.verdict.as_deref()) {
             text.push_str(&format!("Trend: {verdict}\n"));
         }
@@ -2647,7 +2612,7 @@ impl RmonApp {
     }
 
     fn draw_process_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut changed = false;
             ui.label("view:");
             changed |= ui
@@ -2658,35 +2623,46 @@ impl RmonApp {
                 .changed();
             if self.view_mode == ViewMode::Tree {
                 changed |= ui
-                    .checkbox(&mut self.subtree_sort, "rank by subtree total")
+                    .add_enabled(
+                        self.sort_column == SortColumn::Metric,
+                        egui::Checkbox::new(&mut self.subtree_sort, "rank by subtree total"),
+                    )
+                    .on_hover_text(
+                        "CPU/GPU only; other columns rank each process's own current value",
+                    )
                     .changed();
             }
             ui.separator();
             ui.label("sort:");
-            let mut metric_changed = false;
-            metric_changed |= ui
-                .selectable_value(&mut self.sort_metric, SortMetric::Total, "CPU+GPU")
-                .changed();
-            metric_changed |= ui
-                .selectable_value(&mut self.sort_metric, SortMetric::Cpu, "CPU%/core")
-                .changed();
-            metric_changed |= ui
-                .selectable_value(&mut self.sort_metric, SortMetric::Gpu, "GPU%")
-                .changed();
-            metric_changed |= ui
+            for (metric, label) in [
+                (SortMetric::Total, "CPU+GPU"),
+                (SortMetric::Cpu, "CPU%/core"),
+                (SortMetric::Gpu, "GPU%"),
+            ] {
+                if ui
+                    .selectable_label(
+                        self.sort_column == SortColumn::Metric && self.sort_metric == metric,
+                        label,
+                    )
+                    .clicked()
+                {
+                    self.sort_column = SortColumn::Metric;
+                    self.sort_metric = metric;
+                    self.sort_ascending = false;
+                    changed = true;
+                }
+            }
+            ui.label("CPU/GPU window:");
+            changed |= ui
                 .selectable_value(&mut self.sort_window, SortWindow::Instant, "instant")
                 .changed();
-            metric_changed |= ui
+            changed |= ui
                 .selectable_value(
                     &mut self.sort_window,
                     SortWindow::Accumulated,
                     "accumulated (24h)",
                 )
                 .changed();
-            if metric_changed {
-                self.sort_column = SortColumn::Metric;
-            }
-            changed |= metric_changed;
             ui.separator();
             ui.label("search:");
             changed |= ui.text_edit_singleline(&mut self.filter).changed();
@@ -2925,8 +2901,6 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f32], color: egui::Color32) {
 
 impl RmonApp {
     fn draw_table(&mut self, ui: &mut egui::Ui) {
-        use egui_extras::{Column, TableBuilder};
-
         // Rows show percent of one core; this total shows the share of
         // the whole machine, so it stays inside 0-100 and means what a
         // reader expects "total CPU" to mean.
@@ -2945,8 +2919,24 @@ impl RmonApp {
             cores,
             total_gpu
         ));
+        ui.weak("click a header to sort · scroll horizontally for more columns")
+            .on_hover_text("Memory = resident working set · Children = live direct children · open files are scanned on demand in details");
         ui.weak("keyboard: ↑/↓, PgUp/PgDn, Home/End or keypad · right-click a row for actions");
         ui.add_space(4.0);
+
+        // The process panel starts at a third of the window width. Keep
+        // columns readable and reachable rather than squeezing/clipping them.
+        egui::ScrollArea::horizontal()
+            .id_salt("process-table-horizontal")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(940.0);
+                self.draw_process_rows(ui);
+            });
+    }
+
+    fn draw_process_rows(&mut self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
 
         let cur_column = self.sort_column;
         let cur_metric = self.sort_metric;
@@ -2955,11 +2945,9 @@ impl RmonApp {
         let view_mode = self.view_mode;
 
         enum HeaderClick {
-            Pid,
-            Name,
+            Column(SortColumn),
             Cpu,
             Gpu,
-            Src,
         }
         enum ProcessContextAction {
             OpenFiles(u32),
@@ -2976,9 +2964,12 @@ impl RmonApp {
             .striped(true)
             .sense(egui::Sense::click())
             .column(Column::initial(70.0).range(45.0..=160.0).resizable(true))
-            .column(Column::remainder().at_least(80.0).resizable(true))
+            .column(Column::remainder().at_least(160.0).resizable(true))
             .column(Column::initial(140.0).range(90.0..=280.0).resizable(true))
             .column(Column::initial(140.0).range(90.0..=280.0).resizable(true))
+            .column(Column::initial(100.0).range(85.0..=180.0).resizable(true))
+            .column(Column::initial(80.0).range(70.0..=160.0).resizable(true))
+            .column(Column::initial(80.0).range(70.0..=160.0).resizable(true))
             .column(Column::initial(50.0).range(35.0..=120.0).resizable(true));
 
         if self.scroll_to_selected
@@ -2994,13 +2985,13 @@ impl RmonApp {
                 header.col(|ui| {
                     let active = cur_column == SortColumn::Pid;
                     if sort_header(ui, "PID", active, ascending) {
-                        header_click = Some(HeaderClick::Pid);
+                        header_click = Some(HeaderClick::Column(SortColumn::Pid));
                     }
                 });
                 header.col(|ui| {
                     let active = cur_column == SortColumn::Name;
                     if sort_header(ui, "Name", active, ascending) {
-                        header_click = Some(HeaderClick::Name);
+                        header_click = Some(HeaderClick::Column(SortColumn::Name));
                     }
                 });
                 header.col(|ui| {
@@ -3026,12 +3017,18 @@ impl RmonApp {
                         header_click = Some(HeaderClick::Gpu);
                     }
                 });
-                header.col(|ui| {
-                    let active = cur_column == SortColumn::Src;
-                    if sort_header(ui, "Src", active, ascending) {
-                        header_click = Some(HeaderClick::Src);
-                    }
-                });
+                for (label, column) in [
+                    ("Memory", SortColumn::Memory),
+                    ("Handles", SortColumn::Handles),
+                    ("Children", SortColumn::Children),
+                    ("Src", SortColumn::Src),
+                ] {
+                    header.col(|ui| {
+                        if sort_header(ui, label, cur_column == column, ascending) {
+                            header_click = Some(HeaderClick::Column(column));
+                        }
+                    });
+                }
             })
             .body(|body| {
                 let history = &self.history;
@@ -3123,6 +3120,21 @@ impl RmonApp {
                         });
                     });
                     row.col(|ui| {
+                        ui.label(p.mem_bytes.map(format_bytes).unwrap_or_else(|| "—".to_string()))
+                            .on_hover_text(p.mem_bytes.map_or_else(
+                                || "Working-set memory unavailable".to_string(),
+                                |bytes| format!("{bytes} bytes resident (working set, including shared pages); current sample, not accumulated"),
+                            ));
+                    });
+                    row.col(|ui| {
+                        ui.label(p.handle_count.map(|n| n.to_string()).unwrap_or_else(|| "—".to_string()))
+                            .on_hover_text("Total open handles of all types, not just files; — means unavailable");
+                    });
+                    row.col(|ui| {
+                        ui.label(self.child_counts.get(&p.pid).map(|n| n.to_string()).unwrap_or_else(|| "—".to_string()))
+                            .on_hover_text("Live direct children by recorded parent PID in the full snapshot, including filtered/collapsed rows; not all descendants. — means this process is no longer live.");
+                    });
+                    row.col(|ui| {
                         ui.label(gpu_source_label(p.gpu_source));
                     });
 
@@ -3185,9 +3197,10 @@ impl RmonApp {
         }
 
         match header_click {
-            Some(HeaderClick::Pid) => self.apply_column_sort(SortColumn::Pid, true),
-            Some(HeaderClick::Name) => self.apply_column_sort(SortColumn::Name, true),
-            Some(HeaderClick::Src) => self.apply_column_sort(SortColumn::Src, true),
+            Some(HeaderClick::Column(column)) => self.apply_column_sort(
+                column,
+                matches!(column, SortColumn::Pid | SortColumn::Name | SortColumn::Src),
+            ),
             Some(HeaderClick::Cpu) => self.apply_metric_sort(SortMetric::Cpu),
             Some(HeaderClick::Gpu) => self.apply_metric_sort(SortMetric::Gpu),
             None => {}
@@ -3287,7 +3300,7 @@ impl RmonApp {
             ui.colored_label(egui::Color32::RED, err);
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.weak("owner:");
             ui.label(
                 proc_info
@@ -3314,12 +3327,20 @@ impl RmonApp {
             }
             ui.label(handles_text);
             ui.add_space(16.0);
-            ui.weak("memory:");
+            ui.weak("memory (working set):");
             ui.label(
                 proc_info
                     .as_ref()
                     .and_then(|p| p.mem_bytes)
                     .map(format_bytes)
+                    .unwrap_or_else(|| "—".to_string()),
+            );
+            ui.add_space(16.0);
+            ui.weak("live direct children:");
+            ui.label(
+                self.child_counts
+                    .get(&pid)
+                    .map(|n| n.to_string())
                     .unwrap_or_else(|| "—".to_string()),
             );
         });
@@ -3414,11 +3435,14 @@ impl RmonApp {
                     }
                     FilesStatus::Done(scan) => {
                         ui.weak(format!(
-                            "{} file(s)   ({} handles, {} timed out)",
+                            "{} unique path(s) resolved · {} File handles identified\n\
+                             Last scan, best-effort: {} handles inspected, {} name queries timed out",
                             scan.paths.len(),
+                            scan.file_handles,
                             scan.handles_seen,
                             scan.timed_out
                         ));
+                        ui.weak("Not a live or exhaustive count: scans inspect at most 20,000 handles. File handles can include pipes/devices and multiple handles to the same path; inaccessible names are skipped.");
                     }
                     FilesStatus::Error(e) => {
                         ui.colored_label(egui::Color32::RED, format!("error: {e}"));
@@ -3438,7 +3462,7 @@ impl RmonApp {
                     });
             }
             None => {
-                ui.weak("click \"open files\" above to scan");
+                ui.weak("count unknown — click \"open files\" above to scan. File scans are on demand because walking handle tables and resolving paths is too expensive for every sampling tick.");
             }
         }
 
@@ -4006,7 +4030,12 @@ impl RmonApp {
                 let live: HashMap<u32, String> = self
                     .history
                     .latest()
-                    .map(|s| s.processes.iter().map(|p| (p.pid, p.name.clone())).collect())
+                    .map(|s| {
+                        s.processes
+                            .iter()
+                            .map(|p| (p.pid, p.name.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 self.wmi = WmiState::start(self.wmi.lookback_secs, live);
             }
@@ -4018,7 +4047,11 @@ impl RmonApp {
             ui.label("window:");
             let mut minutes = (self.wmi.lookback_secs / 60).max(1);
             if ui
-                .add(egui::DragValue::new(&mut minutes).range(1..=1440).suffix(" min"))
+                .add(
+                    egui::DragValue::new(&mut minutes)
+                        .range(1..=1440)
+                        .suffix(" min"),
+                )
                 .changed()
             {
                 self.wmi.lookback_secs = minutes * 60;
@@ -4068,9 +4101,7 @@ impl RmonApp {
                                             .strong(),
                                     );
                                     ui.label(format!("pid {}", client.pid));
-                                    ui.label(
-                                        client.name.as_deref().unwrap_or("(exited, unnamed)"),
-                                    );
+                                    ui.label(client.name.as_deref().unwrap_or("(exited, unnamed)"));
                                     if client.alive {
                                         ui.colored_label(OK_COLOR, "running");
                                     } else {
@@ -4090,9 +4121,7 @@ impl RmonApp {
                                 for q in client.queries.iter().take(4) {
                                     ui.horizontal(|ui| {
                                         ui.weak(format!("{}x", q.count));
-                                        ui.monospace(
-                                            q.query.chars().take(160).collect::<String>(),
-                                        );
+                                        ui.monospace(q.query.chars().take(160).collect::<String>());
                                     });
                                 }
                             });

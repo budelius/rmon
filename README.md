@@ -107,8 +107,9 @@ Two independent axes, both available in the CLI (`--tree`/`--subtree`), TUI
   processes based on the total usage of all its renderer/GPU-process
   children, not just its own (often near-zero) share.
 
-In the GUI, the process table's column headers (PID, Name, CPU%, GPU%, Src)
-are also independently clickable: clicking one sorts by that column, and a
+In the GUI, the process table's column headers (PID, Name, CPU%, GPU%,
+Memory, Handles, Children, Src) are independently clickable in both flat
+and tree views: clicking one sorts by that column, and a
 ▲/▼ marks the active one — click again to reverse direction. This is on top
 of, not instead of, the header buttons above (which drive the CPU%/GPU%
 metric and instant/accumulated window); clicking a CPU% or GPU% column
@@ -118,7 +119,24 @@ selects it (not just the PID cell). `↑`/`↓`, Page Up/Down, Home/End, and the
 numeric keypad navigate the current row order once no text field has focus;
 left/right (keypad 4/6) collapse or expand tree rows. Right-clicking a row
 opens its context menu for open files, copy info, explain/assess, and kill. The redundant
-Process menu is gone.
+Process menu is gone. Scroll horizontally to reach all columns in a narrow
+process panel, or widen the panel by dragging its divider.
+
+**Memory** is resident working-set usage (including shared pages), shown in
+MiB/GiB. **Handles** counts all open handle types, not just files. Both are
+already collected by the shared system-wide snapshot, with no extra
+per-process OS calls. **Children** counts live direct children by recorded
+parent PID in the full snapshot, including hidden/filtered children, not
+all descendants; it takes one linear pass per tick. These three columns
+always sort each process's current value, independent of the CPU/GPU
+instant/accumulated window and subtree-total option. New selections sort
+largest first; unavailable readings show `—` and stay last in either direction.
+
+Open-file counts remain **on demand in the details panel** via **open files**,
+not polled for every table row. The result distinguishes unique resolved
+paths from identified File handles (which can include pipes/devices), and
+states that it is the last best-effort scan, not an exhaustive live count.
+An unscanned or inaccessible process has an unknown file count, not zero.
 
 ### Installed programs, provenance, and removal review
 

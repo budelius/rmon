@@ -23,20 +23,8 @@ pub fn build_tree<F>(
 where
     F: FnMut(&ProcessSample) -> f32,
 {
-    let pid_set: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
-
-    let mut children: HashMap<Option<u32>, Vec<&ProcessSample>> = HashMap::new();
-    let mut by_pid: HashMap<u32, &ProcessSample> = HashMap::with_capacity(processes.len());
-    for p in processes {
-        // `contains` and `!= p.pid` guard against self-parented and (rarer)
-        // cyclic entries — e.g. Windows' System Idle Process is pid 0 with
-        // ppid 0 — which would otherwise loop the DFS below forever.
-        let parent = p
-            .ppid
-            .filter(|ppid| pid_set.contains(ppid) && *ppid != p.pid);
-        children.entry(parent).or_default().push(p);
-        by_pid.insert(p.pid, p);
-    }
+    let children = process_children(processes);
+    let by_pid = processes.iter().map(|p| (p.pid, p)).collect();
 
     let rank: HashMap<u32, f32> = if by_subtree {
         subtree_sums(&children, &by_pid, &mut key)
@@ -44,16 +32,50 @@ where
         processes.iter().map(|p| (p.pid, key(p))).collect()
     };
 
+    sort_and_flatten(children, processes.len(), |a, b| {
+        let ka = *rank.get(&a.pid).unwrap_or(&0.0);
+        let kb = *rank.get(&b.pid).unwrap_or(&0.0);
+        kb.partial_cmp(&ka).unwrap_or(Ordering::Equal)
+    })
+}
+
+/// Like `build_tree`, but orders roots and siblings with a comparator
+/// instead of a floating-point score. Useful for text columns, exact byte
+/// counts, and keeping unavailable readings last in either direction.
+/// This sorts each process's own value; subtree sums use `build_tree`.
+pub fn build_tree_by<F>(processes: &[ProcessSample], compare: F) -> Vec<(usize, ProcessSample)>
+where
+    F: FnMut(&ProcessSample, &ProcessSample) -> Ordering,
+{
+    sort_and_flatten(process_children(processes), processes.len(), compare)
+}
+
+fn process_children(processes: &[ProcessSample]) -> HashMap<Option<u32>, Vec<&ProcessSample>> {
+    let pid_set: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+    let mut children: HashMap<Option<u32>, Vec<&ProcessSample>> = HashMap::new();
+    for p in processes {
+        let parent = p
+            .ppid
+            .filter(|ppid| pid_set.contains(ppid) && *ppid != p.pid);
+        children.entry(parent).or_default().push(p);
+    }
+    children
+}
+
+fn sort_and_flatten<F>(
+    mut children: HashMap<Option<u32>, Vec<&ProcessSample>>,
+    len: usize,
+    mut compare: F,
+) -> Vec<(usize, ProcessSample)>
+where
+    F: FnMut(&ProcessSample, &ProcessSample) -> Ordering,
+{
     for kids in children.values_mut() {
-        kids.sort_by(|a, b| {
-            let ka = *rank.get(&a.pid).unwrap_or(&0.0);
-            let kb = *rank.get(&b.pid).unwrap_or(&0.0);
-            kb.partial_cmp(&ka).unwrap_or(Ordering::Equal)
-        });
+        kids.sort_by(|a, b| compare(a, b));
     }
 
-    let mut out = Vec::with_capacity(processes.len());
-    let mut visited: HashSet<u32> = HashSet::with_capacity(processes.len());
+    let mut out = Vec::with_capacity(len);
+    let mut visited: HashSet<u32> = HashSet::with_capacity(len);
     let mut stack: Vec<(usize, &ProcessSample)> = children
         .get(&None)
         .into_iter()
@@ -241,6 +263,26 @@ mod tests {
             pids_and_depths,
             vec![(5, 0), (1, 0), (3, 1), (4, 2), (2, 1)]
         );
+    }
+
+    #[test]
+    fn comparator_sorts_roots_and_siblings_by_text() {
+        let mut procs = vec![
+            proc(1, None, 0.0),
+            proc(2, Some(1), 0.0),
+            proc(3, Some(1), 0.0),
+            proc(4, Some(99), 0.0),
+            proc(5, Some(5), 0.0),
+        ];
+        for (p, name) in procs.iter_mut().zip(["B", "Z", "A", "C", "A"]) {
+            p.name = name.to_string();
+        }
+        let tree = build_tree_by(&procs, |a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            tree.iter().map(|(d, p)| (*d, p.pid)).collect::<Vec<_>>(),
+            vec![(0, 5), (0, 1), (1, 3), (1, 2), (0, 4)]
+        );
+        assert!(build_tree_by(&[], |a, b| a.pid.cmp(&b.pid)).is_empty());
     }
 
     #[test]

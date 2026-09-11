@@ -11,8 +11,8 @@ pub mod hello;
 mod history;
 mod hwinfo;
 mod model;
-mod orphans;
 pub mod observability;
+mod orphans;
 pub mod pawnio;
 mod ports;
 mod proc_events;
@@ -26,12 +26,6 @@ mod tree;
 pub mod trends;
 pub mod wmi_activity;
 
-pub use orphans::{
-    DEFAULT_MIN_GROUP, NameCount, OrphanGroup, orphan_groups, significant_groups,
-};
-pub use wmi_activity::{
-    ChannelState, WmiActivityReport, WmiChannel, WmiClient, WmiOperation,
-};
 pub use handles::{
     AllFilesEntry, DEFAULT_SCAN_WORKERS, OpenFilesScan, handle_count, kill_process,
     list_open_files, list_open_files_many,
@@ -46,6 +40,7 @@ pub use model::{
     BoardTemperatureSample, FanSample, GpuSource, GpuTelemetry, ProcessSample, Snapshot,
     SystemMetrics, VoltageSample,
 };
+pub use orphans::{DEFAULT_MIN_GROUP, NameCount, OrphanGroup, orphan_groups, significant_groups};
 pub use ports::{PortEntry, Protocol, TcpState, list_all_ports, listening_ports_for};
 pub use proc_events::{RecentExit, ShortLivedWatcher};
 pub use programs::{
@@ -61,4 +56,5 @@ pub use sensors::{
 };
 pub use storage::Store;
 pub use throttle::{THROTTLE_WINDOW, ThrottleHistory, ThrottleTick};
-pub use tree::{DEFAULT_GHOST_MAX_DEPTH, build_tree, merge_recent_exits};
+pub use tree::{DEFAULT_GHOST_MAX_DEPTH, build_tree, build_tree_by, merge_recent_exits};
+pub use wmi_activity::{ChannelState, WmiActivityReport, WmiChannel, WmiClient, WmiOperation};

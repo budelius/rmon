@@ -61,9 +61,8 @@ pub struct ProcessSample {
     /// trustworthy identity.
     #[serde(default)]
     pub executable_path: Option<String>,
-    /// Total open handle count (all types, not just files) — cheap via
-    /// `GetProcessHandleCount`, unlike the full file-handle scan in
-    /// `handles.rs`.
+    /// Total open handle count (all types, not just files), collected by
+    /// the sampler's system-wide process snapshot without per-pid queries.
     pub handle_count: Option<u32>,
     /// Working-set (resident) memory in bytes, when available.
     pub mem_bytes: Option<u64>,
@@ -226,6 +225,24 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Number of observed live *direct* children for every live pid,
+    /// computed in O(processes) without OS queries. Call on the unfiltered
+    /// snapshot so search/collapse state cannot change the counts. Missing
+    /// parents and self-parent links are ignored; parentage is the recorded
+    /// PPID, not proof of identity across Windows PID reuse.
+    pub fn child_counts(&self) -> std::collections::HashMap<u32, u32> {
+        let mut counts: std::collections::HashMap<u32, u32> =
+            self.processes.iter().map(|p| (p.pid, 0)).collect();
+        for p in &self.processes {
+            if let Some(ppid) = p.ppid.filter(|ppid| *ppid != p.pid)
+                && let Some(count) = counts.get_mut(&ppid)
+            {
+                *count += 1;
+            }
+        }
+        counts
+    }
+
     /// Total CPU percent across all sampled processes, in single-core
     /// units — so this legitimately reaches `100 * logical_cores` on a
     /// fully loaded machine. Use `total_cpu_percent_of_machine` for the
@@ -303,6 +320,28 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn children_are_live_direct_children_not_descendants() {
+        let mut snap = snapshot(1, &[0.0; 6]);
+        // 1 -> 2 -> 3, 1 -> 4, missing parent -> 5, self-parented 6.
+        for (p, parent) in
+            snap.processes
+                .iter_mut()
+                .zip([None, Some(1), Some(2), Some(1), Some(99), Some(6)])
+        {
+            p.ppid = parent;
+        }
+        let counts = snap.child_counts();
+        assert_eq!(counts[&1], 2);
+        assert_eq!(counts[&2], 1);
+        for pid in 3..=6 {
+            assert_eq!(counts[&pid], 0);
+        }
+        assert!(!counts.contains_key(&99));
+        snap.processes.clear();
+        assert!(snap.child_counts().is_empty());
     }
 
     /// The bug this exists to prevent: a single-threaded process pegging
